@@ -33,3 +33,33 @@ dart run bin/server.dart
 curl -s localhost:8080/health
 # {"status":"ok","database":"connected"}
 ```
+
+## Auth (JWT + bcrypt)
+
+### Migratsiyalarni ishga tushirish
+
+`lib/db/migrations/` papkasidagi `.sql` fayllar `bin/migrate.dart` orqali bajariladi
+(kuzatuv `schema_migrations` jadvalida yuritiladi, takror bajarilmaydi):
+
+```
+dart run bin/migrate.dart
+```
+
+### Endpointlar
+
+```
+# Dastlabki admin foydalanuvchini yaratish (faqat users bo'sh bo'lganda)
+curl -s -X POST localhost:8080/setup \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@eclair.uz","password":"Test1234!","full_name":"Admin"}'
+
+# Login - JWT token oladi
+curl -s -X POST localhost:8080/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@eclair.uz","password":"Test1234!"}'
+
+# Joriy foydalanuvchi (auth middleware orqali himoyalangan)
+curl -s localhost:8080/me -H "Authorization: Bearer <TOKEN>"
+```
+
+`.env`ga `JWT_SECRET` qatorini qo'shing (token imzolash uchun).

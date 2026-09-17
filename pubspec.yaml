@@ -8,6 +8,8 @@ environment:
 
 dependencies:
   args: ^2.4.0
+  dart_jsonwebtoken: ^2.17.0
+  dbcrypt: ^2.0.0
   dotenv: ^4.2.0
   postgres: ^2.6.3
   shelf: ^1.4.0

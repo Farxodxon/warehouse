@@ -9,6 +9,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "67.0.0"
+  adaptive_number:
+    dependency: transitive
+    description:
+      name: adaptive_number
+      sha256: "3a567544e9b5c9c803006f51140ad544aedc79604fd4f3f2c1380003f97c1d77"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.0.0"
   analyzer:
     dependency: transitive
     description:
@@ -57,6 +65,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.4.0"
+  clock:
+    dependency: transitive
+    description:
+      name: clock
+      sha256: cb6d7f03e1de671e34607e909a7213e31d7752be4fb66a86d29fe1eb14bfb5cf
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.1.1"
   collection:
     dependency: transitive
     description:
@@ -89,6 +105,22 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "3.0.3"
+  dart_jsonwebtoken:
+    dependency: "direct main"
+    description:
+      name: dart_jsonwebtoken
+      sha256: "00a0812d2aeaeb0d30bcbc4dd3cee57971dbc0ab2216adf4f0247f37793f15ef"
+      url: "https://pub.dev"
+    source: hosted
+    version: "2.17.0"
+  dbcrypt:
+    dependency: "direct main"
+    description:
+      name: dbcrypt
+      sha256: b32a786486509ddc31b1fa97932a2fc9a3838bbed5d82e43bd636604c96b031e
+      url: "https://pub.dev"
+    source: hosted
+    version: "2.0.0"
   dotenv:
     dependency: "direct main"
     description:
@@ -97,6 +129,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "4.2.0"
+  ed25519_edwards:
+    dependency: transitive
+    description:
+      name: ed25519_edwards
+      sha256: f3c3b109a0e470ee35f6346a155cab290578660852237fce10df6bbd92758534
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.3.2"
   file:
     dependency: transitive
     description:
@@ -105,6 +145,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "7.0.1"
+  fixnum:
+    dependency: transitive
+    description:
+      name: fixnum
+      sha256: b6dc7065e46c974bc7c5f143080a6764ec7a4be6da1285ececdc37be96de53be
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.1.1"
   frontend_server_client:
     dependency: transitive
     description:
@@ -233,6 +281,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.9.0"
+  pointycastle:
+    dependency: transitive
+    description:
+      name: pointycastle
+      sha256: "4be0097fcf3fd3e8449e53730c631200ebc7b88016acecab2b0da2f0149222fe"
+      url: "https://pub.dev"
+    source: hosted
+    version: "3.9.1"
   pool:
     dependency: transitive
     description:
