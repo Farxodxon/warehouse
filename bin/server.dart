@@ -5,6 +5,7 @@ import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart';
 import 'package:shelf_router/shelf_router.dart';
 
+import 'package:wms_backend/auth/authorization.dart';
 import 'package:wms_backend/auth/jwt.dart';
 import 'package:wms_backend/auth/middleware.dart';
 import 'package:wms_backend/auth/password.dart';
@@ -14,7 +15,12 @@ final _router = Router()
   ..get('/health', _healthHandler)
   ..post('/setup', _setupHandler)
   ..post('/login', _loginHandler)
-  ..get('/me', authMiddleware()(_meHandler));
+  ..get('/me', authMiddleware()(_meHandler))
+  ..get('/warehouses', authMiddleware()(_listWarehousesHandler))
+  ..post('/warehouses', authMiddleware()(_createWarehouseHandler))
+  ..get('/warehouses/<id>', authMiddleware()(_getWarehouseHandler))
+  ..post('/warehouses/<id>/users', authMiddleware()(_assignUserToWarehouseHandler))
+  ..get('/warehouses/<id>/users', authMiddleware()(_listWarehouseUsersHandler));
 
 Response _jsonResponse(int statusCode, String body) {
   return Response(statusCode,
@@ -130,7 +136,8 @@ Future<Response> _meHandler(Request request) async {
   final connection = await openConnection();
   try {
     final result = await connection.query(
-      'SELECT id, email, full_name, role FROM users WHERE id = @id',
+      'SELECT id, email, full_name, role, organization_id FROM users '
+      'WHERE id = @id',
       substitutionValues: {'id': userId},
     );
     if (result.isEmpty) {
@@ -142,7 +149,262 @@ Future<Response> _meHandler(Request request) async {
       'email': row[1],
       'full_name': row[2],
       'role': row[3],
+      'organization_id': row[4],
     });
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _listWarehousesHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final isSuper = await isSuperAdmin(userId);
+
+  final connection = await openConnection();
+  try {
+    final result = await connection.query(
+      'SELECT w.id, w.name, w.address, w.city, uwa.role '
+      'FROM warehouses w '
+      'LEFT JOIN user_warehouse_access uwa '
+      '  ON uwa.warehouse_id = w.id AND uwa.user_id = @userId '
+      'WHERE @isSuper = TRUE OR uwa.id IS NOT NULL '
+      'ORDER BY w.id',
+      substitutionValues: {'userId': userId, 'isSuper': isSuper},
+    );
+
+    final warehouses = <Map<String, dynamic>>[];
+    for (final row in result) {
+      final role = row[4] as String? ?? (isSuper ? 'super_admin' : null);
+      warehouses.add({
+        'id': row[0],
+        'name': row[1],
+        'address': row[2],
+        'city': row[3],
+        'role': role,
+      });
+    }
+    return _jsonResponse(200, jsonEncode(warehouses));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _createWarehouseHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  if (!await isSuperAdmin(userId)) {
+    return _jsonResponse(403, '{"error":"forbidden"}');
+  }
+
+  final dynamic body;
+  try {
+    body = jsonDecode(await request.readAsString());
+  } catch (_) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final name = body['name'] as String?;
+  final address = body['address'] as String?;
+  final city = body['city'] as String?;
+  if (name == null || name.isEmpty) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final connection = await openConnection();
+  try {
+    final orgResult = await connection.query(
+      'SELECT organization_id FROM users WHERE id = @userId',
+      substitutionValues: {'userId': userId},
+    );
+    if (orgResult.isEmpty || orgResult.first.first == null) {
+      return _jsonResponse(400, '{"error":"invalid_request"}');
+    }
+    final organizationId = orgResult.first.first as int;
+
+    final insertResult = await connection.query(
+      'INSERT INTO warehouses (organization_id, name, address, city) '
+      'VALUES (@organizationId, @name, @address, @city) RETURNING id',
+      substitutionValues: {
+        'organizationId': organizationId,
+        'name': name,
+        'address': address,
+        'city': city,
+      },
+    );
+    final warehouseId = insertResult.first.first as int;
+
+    await connection.execute(
+      'INSERT INTO user_warehouse_access (user_id, warehouse_id, role) '
+      'VALUES (@userId, @warehouseId, @role)',
+      substitutionValues: {
+        'userId': userId,
+        'warehouseId': warehouseId,
+        'role': 'warehouse_manager',
+      },
+    );
+
+    return _jsonResponseBody(201, {
+      'id': warehouseId,
+      'name': name,
+      'address': address,
+      'city': city,
+      'role': 'warehouse_manager',
+    });
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _getWarehouseHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final warehouseId = int.parse(request.params['id']!);
+
+  final connection = await openConnection();
+  try {
+    final result = await connection.query(
+      'SELECT id, name, address, city FROM warehouses WHERE id = @id',
+      substitutionValues: {'id': warehouseId},
+    );
+    if (result.isEmpty) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+
+    final isSuper = await isSuperAdmin(userId);
+    final role = await getUserRoleForWarehouse(userId, warehouseId);
+    if (!isSuper && role == null) {
+      return _jsonResponse(403, '{"error":"forbidden"}');
+    }
+
+    final row = result.first;
+    return _jsonResponseBody(200, {
+      'id': row[0],
+      'name': row[1],
+      'address': row[2],
+      'city': row[3],
+      'role': role ?? 'super_admin',
+    });
+  } finally {
+    await connection.close();
+  }
+}
+
+const _allowedWarehouseRoles = [
+  'super_admin',
+  'warehouse_manager',
+  'operator',
+  'viewer',
+];
+
+Future<Response> _assignUserToWarehouseHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final warehouseId = int.parse(request.params['id']!);
+
+  final dynamic body;
+  try {
+    body = jsonDecode(await request.readAsString());
+  } catch (_) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final targetUserId = body['user_id'] as int?;
+  final role = body['role'] as String?;
+  if (targetUserId == null ||
+      role == null ||
+      !_allowedWarehouseRoles.contains(role)) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final connection = await openConnection();
+  try {
+    final warehouseResult = await connection.query(
+      'SELECT id FROM warehouses WHERE id = @id',
+      substitutionValues: {'id': warehouseId},
+    );
+    if (warehouseResult.isEmpty) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+
+    final isSuper = await isSuperAdmin(userId);
+    final managerRole = await getUserRoleForWarehouse(userId, warehouseId);
+    if (!isSuper && managerRole != 'warehouse_manager') {
+      return _jsonResponse(403, '{"error":"forbidden"}');
+    }
+
+    final userResult = await connection.query(
+      'SELECT id FROM users WHERE id = @id',
+      substitutionValues: {'id': targetUserId},
+    );
+    if (userResult.isEmpty) {
+      return _jsonResponse(400, '{"error":"invalid_request"}');
+    }
+
+    final existing = await connection.query(
+      'SELECT id FROM user_warehouse_access '
+      'WHERE user_id = @userId AND warehouse_id = @warehouseId',
+      substitutionValues: {'userId': targetUserId, 'warehouseId': warehouseId},
+    );
+    if (existing.isNotEmpty) {
+      return _jsonResponse(409, '{"error":"already_assigned"}');
+    }
+
+    final insertResult = await connection.query(
+      'INSERT INTO user_warehouse_access (user_id, warehouse_id, role) '
+      'VALUES (@userId, @warehouseId, @role) RETURNING id',
+      substitutionValues: {
+        'userId': targetUserId,
+        'warehouseId': warehouseId,
+        'role': role,
+      },
+    );
+
+    return _jsonResponseBody(201, {
+      'id': insertResult.first.first,
+      'user_id': targetUserId,
+      'warehouse_id': warehouseId,
+      'role': role,
+    });
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _listWarehouseUsersHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final warehouseId = int.parse(request.params['id']!);
+
+  final connection = await openConnection();
+  try {
+    final warehouseResult = await connection.query(
+      'SELECT id FROM warehouses WHERE id = @id',
+      substitutionValues: {'id': warehouseId},
+    );
+    if (warehouseResult.isEmpty) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+
+    final isSuper = await isSuperAdmin(userId);
+    final accessRole = await getUserRoleForWarehouse(userId, warehouseId);
+    if (!isSuper && accessRole == null) {
+      return _jsonResponse(403, '{"error":"forbidden"}');
+    }
+
+    final result = await connection.query(
+      'SELECT u.id, u.email, u.full_name, uwa.role '
+      'FROM user_warehouse_access uwa '
+      'JOIN users u ON u.id = uwa.user_id '
+      'WHERE uwa.warehouse_id = @warehouseId '
+      'ORDER BY u.id',
+      substitutionValues: {'warehouseId': warehouseId},
+    );
+
+    final users = result
+        .map((row) => {
+              'id': row[0],
+              'email': row[1],
+              'full_name': row[2],
+              'role': row[3],
+            })
+        .toList();
+    return _jsonResponse(200, jsonEncode(users));
   } finally {
     await connection.close();
   }
