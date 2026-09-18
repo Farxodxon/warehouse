@@ -11,6 +11,7 @@ import 'package:wms_backend/auth/middleware.dart';
 import 'package:wms_backend/auth/password.dart';
 import 'package:wms_backend/db/connection.dart';
 import 'package:wms_backend/products/attribute_schema.dart';
+import 'package:wms_backend/products/attribute_values.dart';
 
 final _router = Router()
   ..get('/health', _healthHandler)
@@ -27,7 +28,13 @@ final _router = Router()
   ..post('/product-categories',
       authMiddleware()(_createProductCategoryHandler))
   ..get('/product-categories/<id>',
-      authMiddleware()(_getProductCategoryHandler));
+      authMiddleware()(_getProductCategoryHandler))
+  ..get('/products', authMiddleware()(_listProductsHandler))
+  ..post('/products', authMiddleware()(_createProductHandler))
+  ..get('/products/barcode/<barcode>',
+      authMiddleware()(_getProductByBarcodeHandler))
+  ..get('/products/<id>', authMiddleware()(_getProductHandler))
+  ..put('/products/<id>', authMiddleware()(_updateProductHandler));
 
 Response _jsonResponse(int statusCode, String body) {
   return Response(statusCode,
@@ -549,6 +556,397 @@ Future<Response> _getProductCategoryHandler(Request request) async {
 
 return _jsonResponse(
             200, jsonEncode(_rowToProductCategory(result.first)));
+  } finally {
+    await connection.close();
+  }
+}
+
+Map<String, dynamic> _rowToProduct(List row, String categoryName) {
+  return {
+    'id': row[0],
+    'organization_id': row[1],
+    'category_id': row[2],
+    'sku': row[3],
+    'barcode': row[4],
+    'name': row[5],
+    'unit': row[6],
+    'min_stock': _toNumOrNull(row[7]),
+    'max_stock': _toNumOrNull(row[8]),
+    'default_shelf_life_days': row[9],
+    'attributes': row[10],
+    'created_at': (row[11] as DateTime).toUtc().toIso8601String(),
+    'category_name': categoryName,
+  };
+}
+
+num? _toNumOrNull(dynamic value) {
+  if (value == null) return null;
+  if (value is num) return value;
+  if (value is String) return num.tryParse(value);
+  return null;
+}
+
+Future<bool> _canManageProducts(int userId) async {
+  final connection = await openConnection();
+  try {
+    final result = await connection.query(
+      'SELECT role FROM users WHERE id = @userId',
+      substitutionValues: {'userId': userId},
+    );
+    if (result.isEmpty) return false;
+    if (result.first.first == 'super_admin') return true;
+
+    final accessResult = await connection.query(
+      'SELECT 1 FROM user_warehouse_access '
+      'WHERE user_id = @userId AND role = \'warehouse_manager\' LIMIT 1',
+      substitutionValues: {'userId': userId},
+    );
+    return accessResult.isNotEmpty;
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _listProductsHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final categoryId = int.tryParse(request.url.queryParameters['category_id'] ?? '');
+    final search = request.url.queryParameters['search']?.trim();
+
+    final conditions = <String>['p.organization_id = @orgId'];
+    final values = <String, dynamic>{'orgId': organizationId};
+    if (categoryId != null) {
+      conditions.add('p.category_id = @categoryId');
+      values['categoryId'] = categoryId;
+    }
+    if (search != null && search.isNotEmpty) {
+      conditions.add('(p.name ILIKE @search OR p.sku ILIKE @search)');
+      values['search'] = '%$search%';
+    }
+
+    final result = await connection.query(
+      'SELECT p.id, p.organization_id, p.category_id, p.sku, p.barcode, '
+      'p.name, p.unit, p.min_stock, p.max_stock, p.default_shelf_life_days, '
+      'p.attributes, p.created_at, c.name '
+      'FROM products p '
+      'JOIN product_categories c ON c.id = p.category_id '
+      'WHERE ${conditions.join(' AND ')} '
+      'ORDER BY p.id',
+      substitutionValues: values,
+    );
+
+    final products = result
+        .map((row) => _rowToProduct(row, row[12] as String))
+        .toList();
+    return _jsonResponse(200, jsonEncode(products));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _createProductHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  if (!await _canManageProducts(userId)) {
+    return _jsonResponse(403, '{"error":"forbidden"}');
+  }
+
+  final dynamic body;
+  try {
+    body = jsonDecode(await request.readAsString());
+  } catch (_) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final categoryId = body['category_id'];
+  final sku = body['sku'];
+  final name = body['name'];
+  final unit = body['unit'];
+  if (categoryId is! int ||
+      sku is! String ||
+      sku.isEmpty ||
+      name is! String ||
+      name.isEmpty ||
+      unit is! String ||
+      unit.isEmpty) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final barcode = body['barcode'];
+  final minStock = body['min_stock'];
+  final maxStock = body['max_stock'];
+  final defaultShelfLifeDays = body['default_shelf_life_days'];
+  final attributes = body['attributes'];
+  if (minStock != null && minStock is! num) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+  if (maxStock != null && maxStock is! num) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+  if (defaultShelfLifeDays != null && defaultShelfLifeDays is! int) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+  if (attributes == null || attributes is! Map) {
+    return _jsonResponse(400, '{"error":"invalid_attributes","details":["attributes must be an object"]}');
+  }
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final categoryResult = await connection.query(
+      'SELECT attribute_schema FROM product_categories '
+      'WHERE id = @categoryId AND organization_id = @orgId',
+      substitutionValues: {'categoryId': categoryId, 'orgId': organizationId},
+    );
+    if (categoryResult.isEmpty) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+    final schema = categoryResult.first.first as List;
+
+    final errors = validateAttributeValues(
+        Map<String, dynamic>.from(attributes), schema);
+    if (errors.isNotEmpty) {
+      return _jsonResponse(
+          400,
+          jsonEncode({'error': 'invalid_attributes', 'details': errors}));
+    }
+
+    final existing = await connection.query(
+      'SELECT 1 FROM products '
+      'WHERE organization_id = @orgId AND sku = @sku',
+      substitutionValues: {'orgId': organizationId, 'sku': sku},
+    );
+    if (existing.isNotEmpty) {
+      return _jsonResponse(409, '{"error":"sku_already_exists"}');
+    }
+
+    final result = await connection.query(
+      'INSERT INTO products '
+      '(organization_id, category_id, sku, barcode, name, unit, min_stock, '
+      'max_stock, default_shelf_life_days, attributes) '
+      'VALUES (@orgId, @categoryId, @sku, @barcode, @name, @unit, @minStock, '
+      '@maxStock, @defaultShelfLifeDays, @attributes::jsonb) '
+      'RETURNING id, organization_id, category_id, sku, barcode, name, unit, '
+      'min_stock, max_stock, default_shelf_life_days, attributes, created_at',
+      substitutionValues: {
+        'orgId': organizationId,
+        'categoryId': categoryId,
+        'sku': sku,
+        'barcode': barcode,
+        'name': name,
+        'unit': unit,
+        'minStock': minStock,
+        'maxStock': maxStock,
+        'defaultShelfLifeDays': defaultShelfLifeDays,
+        'attributes': jsonEncode(attributes),
+      },
+    );
+
+    final categoryName = (await connection.query(
+      'SELECT name FROM product_categories WHERE id = @categoryId',
+      substitutionValues: {'categoryId': categoryId},
+    ))
+        .first
+        .first as String;
+
+    return _jsonResponse(
+        201, jsonEncode(_rowToProduct(result.first, categoryName)));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _getProductHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final productId = int.parse(request.params['id']!);
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final result = await connection.query(
+      'SELECT p.id, p.organization_id, p.category_id, p.sku, p.barcode, '
+      'p.name, p.unit, p.min_stock, p.max_stock, p.default_shelf_life_days, '
+      'p.attributes, p.created_at, c.name '
+      'FROM products p '
+      'JOIN product_categories c ON c.id = p.category_id '
+      'WHERE p.id = @id AND p.organization_id = @orgId',
+      substitutionValues: {'id': productId, 'orgId': organizationId},
+    );
+    if (result.isEmpty) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+
+    final row = result.first;
+    return _jsonResponse(
+        200, jsonEncode(_rowToProduct(row, row[12] as String)));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _getProductByBarcodeHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final barcode = request.params['barcode']!;
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final result = await connection.query(
+      'SELECT p.id, p.organization_id, p.category_id, p.sku, p.barcode, '
+      'p.name, p.unit, p.min_stock, p.max_stock, p.default_shelf_life_days, '
+      'p.attributes, p.created_at, c.name '
+      'FROM products p '
+      'JOIN product_categories c ON c.id = p.category_id '
+      'WHERE p.barcode = @barcode AND p.organization_id = @orgId',
+      substitutionValues: {'barcode': barcode, 'orgId': organizationId},
+    );
+    if (result.isEmpty) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+
+    final row = result.first;
+    return _jsonResponse(
+        200, jsonEncode(_rowToProduct(row, row[12] as String)));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _updateProductHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  if (!await _canManageProducts(userId)) {
+    return _jsonResponse(403, '{"error":"forbidden"}');
+  }
+
+  final productId = int.parse(request.params['id']!);
+
+  final dynamic body;
+  try {
+    body = jsonDecode(await request.readAsString());
+  } catch (_) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final existing = await connection.query(
+      'SELECT category_id FROM products '
+      'WHERE id = @id AND organization_id = @orgId',
+      substitutionValues: {'id': productId, 'orgId': organizationId},
+    );
+    if (existing.isEmpty) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+    final categoryId = existing.first.first as int;
+
+    final name = body['name'];
+    final unit = body['unit'];
+    final minStock = body['min_stock'];
+    final maxStock = body['max_stock'];
+    final hasMinStock = body.containsKey('min_stock');
+    final hasMaxStock = body.containsKey('max_stock');
+    final attributes = body['attributes'];
+
+    if (name != null && name is! String) {
+      return _jsonResponse(400, '{"error":"invalid_request"}');
+    }
+    if (unit != null && unit is! String) {
+      return _jsonResponse(400, '{"error":"invalid_request"}');
+    }
+    if (hasMinStock && minStock is! num && minStock != null) {
+      return _jsonResponse(400, '{"error":"invalid_request"}');
+    }
+    if (hasMaxStock && maxStock is! num && maxStock != null) {
+      return _jsonResponse(400, '{"error":"invalid_request"}');
+    }
+
+    if (attributes != null || body.containsKey('attributes')) {
+      if (attributes is! Map) {
+        return _jsonResponse(400,
+            '{"error":"invalid_attributes","details":["attributes must be an object"]}');
+      }
+      final schemaResult = await connection.query(
+        'SELECT attribute_schema FROM product_categories WHERE id = @categoryId',
+        substitutionValues: {'categoryId': categoryId},
+      );
+      final schema = schemaResult.first.first as List;
+      final errors = validateAttributeValues(
+          Map<String, dynamic>.from(attributes), schema);
+      if (errors.isNotEmpty) {
+        return _jsonResponse(
+            400,
+            jsonEncode({'error': 'invalid_attributes', 'details': errors}));
+      }
+    }
+
+    final sets = <String>[];
+    final values = <String, dynamic>{'id': productId};
+    if (name != null) {
+      sets.add('name = @name');
+      values['name'] = name;
+    }
+    if (unit != null) {
+      sets.add('unit = @unit');
+      values['unit'] = unit;
+    }
+    if (hasMinStock) {
+      sets.add('min_stock = @minStock');
+      values['minStock'] = minStock;
+    }
+    if (hasMaxStock) {
+      sets.add('max_stock = @maxStock');
+      values['maxStock'] = maxStock;
+    }
+    if (body.containsKey('attributes')) {
+      sets.add('attributes = @attributes::jsonb');
+      values['attributes'] = jsonEncode(attributes);
+    }
+    if (sets.isEmpty) {
+      return _jsonResponse(400, '{"error":"invalid_request"}');
+    }
+
+    await connection.execute(
+      'UPDATE products SET ${sets.join(', ')} '
+      'WHERE id = @id AND organization_id = @orgId',
+      substitutionValues: {...values, 'orgId': organizationId},
+    );
+
+    final result = await connection.query(
+      'SELECT p.id, p.organization_id, p.category_id, p.sku, p.barcode, '
+      'p.name, p.unit, p.min_stock, p.max_stock, p.default_shelf_life_days, '
+      'p.attributes, p.created_at, c.name '
+      'FROM products p '
+      'JOIN product_categories c ON c.id = p.category_id '
+      'WHERE p.id = @id AND p.organization_id = @orgId',
+      substitutionValues: {'id': productId, 'orgId': organizationId},
+    );
+
+    final row = result.first;
+    return _jsonResponse(
+        200, jsonEncode(_rowToProduct(row, row[12] as String)));
   } finally {
     await connection.close();
   }
