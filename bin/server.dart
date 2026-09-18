@@ -58,7 +58,13 @@ final _router = Router()
   ..get('/batches/<batchId>/containers',
       authMiddleware()(_listBatchContainersHandler))
   ..get('/containers/barcode/<barcode>',
-      authMiddleware()(_getContainerByBarcodeHandler));
+      authMiddleware()(_getContainerByBarcodeHandler))
+  ..post('/inventory/out', authMiddleware()(_inventoryOutHandler))
+  ..post('/inventory/transfer', authMiddleware()(_inventoryTransferHandler))
+  ..post('/inventory/adjustment',
+      authMiddleware()(_inventoryAdjustmentHandler))
+  ..get('/inventory/transactions',
+      authMiddleware()(_listInventoryTransactionsHandler));
 
 Response _jsonResponse(int statusCode, String body) {
   return Response(statusCode,
@@ -619,6 +625,28 @@ Future<bool> _canManageProducts(int userId) async {
     );
     if (result.isEmpty) return false;
     if (result.first.first == 'super_admin') return true;
+
+    final accessResult = await connection.query(
+      'SELECT 1 FROM user_warehouse_access '
+      'WHERE user_id = @userId AND role = \'warehouse_manager\' LIMIT 1',
+      substitutionValues: {'userId': userId},
+    );
+    return accessResult.isNotEmpty;
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<bool> _canOperateInventory(int userId) async {
+  final connection = await openConnection();
+  try {
+    final result = await connection.query(
+      'SELECT role FROM users WHERE id = @userId',
+      substitutionValues: {'userId': userId},
+    );
+    if (result.isEmpty) return false;
+    if (result.first.first == 'super_admin') return true;
+    if (result.first.first == 'operator') return true;
 
     final accessResult = await connection.query(
       'SELECT 1 FROM user_warehouse_access '
@@ -1654,6 +1682,369 @@ Future<Response> _listProductLocationsHandler(Request request) async {
             })
         .toList();
     return _jsonResponse(200, jsonEncode(locations));
+  } finally {
+    await connection.close();
+  }
+}
+
+/// Returns container row (id, batch_id, container_barcode, quantity,
+/// location_id, status) if it belongs to [organizationId], else null.
+Future<List?> _findContainerInOrg(
+    dynamic connection, int containerId, int organizationId) async {
+  final result = await connection.query(
+    'SELECT bc.id, bc.batch_id, bc.container_barcode, bc.quantity, '
+    'bc.location_id, bc.status '
+    'FROM batch_containers bc '
+    'JOIN batches b ON b.id = bc.batch_id '
+    'JOIN products p ON p.id = b.product_id '
+    'WHERE bc.id = @containerId AND p.organization_id = @orgId',
+    substitutionValues: {'containerId': containerId, 'orgId': organizationId},
+  );
+  if (result.isEmpty) return null;
+  return result.first;
+}
+
+/// Returns storage_location id if it exists and belongs to user's organization
+/// (via its warehouse), else null.
+Future<Response?> _requireLocationInOrg(
+    dynamic connection, int locationId, int organizationId) async {
+  final result = await connection.query(
+    'SELECT 1 FROM storage_locations sl '
+    'JOIN warehouses w ON w.id = sl.warehouse_id '
+    'WHERE sl.id = @locationId AND w.organization_id = @orgId',
+    substitutionValues: {'locationId': locationId, 'orgId': organizationId},
+  );
+  if (result.isEmpty) {
+    return _jsonResponse(404, '{"error":"not_found"}');
+  }
+  return null;
+}
+
+Map<String, dynamic> _containerStateResponse(List container) {
+  final quantity = _toNumOrNull(container[3]);
+  return {
+    'batch_container_id': container[0],
+    'batch_id': container[1],
+    'container_barcode': container[2],
+    'quantity': quantity,
+    'location_id': container[4],
+    'status': container[5],
+  };
+}
+
+Future<Response> _inventoryOutHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  if (!await _canOperateInventory(userId)) {
+    return _jsonResponse(403, '{"error":"forbidden"}');
+  }
+
+  final dynamic body;
+  try {
+    body = jsonDecode(await request.readAsString());
+  } catch (_) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final containerId = body['batch_container_id'] as int?;
+  final quantity = body['quantity'] as num?;
+  final note = body['note'] as String?;
+  if (containerId == null || quantity == null || quantity <= 0) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final container = await _findContainerInOrg(connection, containerId, organizationId);
+    if (container == null) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+
+    final currentQuantity = _toNumOrNull(container[3]) ?? 0;
+    if (quantity > currentQuantity) {
+      return _jsonResponse(
+          400,
+          jsonEncode({
+            'error': 'insufficient_quantity',
+            'available': currentQuantity,
+          }));
+    }
+
+    final remaining = (currentQuantity - quantity).toDouble();
+    final locationId = container[4] as int?;
+
+    await connection.execute(
+      'UPDATE batch_containers SET quantity = @remaining WHERE id = @containerId',
+      substitutionValues: {'remaining': remaining, 'containerId': containerId},
+    );
+
+    if (locationId != null) {
+      await connection.execute(
+        'UPDATE storage_locations '
+        'SET current_units = current_units - @quantity WHERE id = @locationId',
+        substitutionValues: {'quantity': quantity, 'locationId': locationId},
+      );
+    }
+
+    await connection.execute(
+      'INSERT INTO inventory_transactions '
+      '(organization_id, type, batch_container_id, from_location_id, '
+      'quantity, performed_by, note) '
+      'VALUES (@orgId, \'OUT\', @containerId, @locationId, @quantity, '
+      '@performedBy, @note)',
+      substitutionValues: {
+        'orgId': organizationId,
+        'containerId': containerId,
+        'locationId': locationId,
+        'quantity': quantity,
+        'performedBy': userId,
+        'note': note,
+      },
+    );
+
+    final result = await connection.query(
+      'SELECT bc.id, bc.batch_id, bc.container_barcode, bc.quantity, '
+      'bc.location_id, bc.status '
+      'FROM batch_containers bc WHERE bc.id = @containerId',
+      substitutionValues: {'containerId': containerId},
+    );
+    final state = _containerStateResponse(result.first);
+    state['remaining_quantity'] = state['quantity'];
+    state['quantity'] = quantity;
+    return _jsonResponse(201, jsonEncode(state));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _inventoryTransferHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  if (!await _canOperateInventory(userId)) {
+    return _jsonResponse(403, '{"error":"forbidden"}');
+  }
+
+  final dynamic body;
+  try {
+    body = jsonDecode(await request.readAsString());
+  } catch (_) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final containerId = body['batch_container_id'] as int?;
+  final toLocationId = body['to_location_id'] as int?;
+  final note = body['note'] as String?;
+  if (containerId == null || toLocationId == null) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final container = await _findContainerInOrg(connection, containerId, organizationId);
+    if (container == null) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+
+    final locCheck =
+        await _requireLocationInOrg(connection, toLocationId, organizationId);
+    if (locCheck != null) return locCheck;
+
+    final quantity = _toNumOrNull(container[3]) ?? 0;
+    final fromLocationId = container[4] as int?;
+
+    if (fromLocationId != null) {
+      await connection.execute(
+        'UPDATE storage_locations '
+        'SET current_units = current_units - @quantity WHERE id = @fromLocationId',
+        substitutionValues: {'quantity': quantity, 'fromLocationId': fromLocationId},
+      );
+    }
+
+    await connection.execute(
+      'UPDATE storage_locations '
+      'SET current_units = current_units + @quantity WHERE id = @toLocationId',
+      substitutionValues: {'quantity': quantity, 'toLocationId': toLocationId},
+    );
+
+    await connection.execute(
+      'UPDATE batch_containers SET location_id = @toLocationId '
+      'WHERE id = @containerId',
+      substitutionValues: {'toLocationId': toLocationId, 'containerId': containerId},
+    );
+
+    await connection.execute(
+      'INSERT INTO inventory_transactions '
+      '(organization_id, type, batch_container_id, from_location_id, '
+      'to_location_id, quantity, performed_by, note) '
+      'VALUES (@orgId, \'TRANSFER\', @containerId, @fromLocationId, '
+      '@toLocationId, @quantity, @performedBy, @note)',
+      substitutionValues: {
+        'orgId': organizationId,
+        'containerId': containerId,
+        'fromLocationId': fromLocationId,
+        'toLocationId': toLocationId,
+        'quantity': quantity,
+        'performedBy': userId,
+        'note': note,
+      },
+    );
+
+    final result = await connection.query(
+      'SELECT bc.id, bc.batch_id, bc.container_barcode, bc.quantity, '
+      'bc.location_id, bc.status '
+      'FROM batch_containers bc WHERE bc.id = @containerId',
+      substitutionValues: {'containerId': containerId},
+    );
+    return _jsonResponse(201, jsonEncode(_containerStateResponse(result.first)));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _inventoryAdjustmentHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  if (!await _canManageProducts(userId)) {
+    return _jsonResponse(403, '{"error":"forbidden"}');
+  }
+
+  final dynamic body;
+  try {
+    body = jsonDecode(await request.readAsString());
+  } catch (_) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final containerId = body['batch_container_id'] as int?;
+  final newQuantity = body['new_quantity'] as num?;
+  final note = body['note'] as String?;
+  if (containerId == null || newQuantity == null || newQuantity < 0) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+  if (note == null || note.trim().isEmpty) {
+    return _jsonResponse(400, '{"error":"note_required"}');
+  }
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final container = await _findContainerInOrg(connection, containerId, organizationId);
+    if (container == null) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+
+    final oldQuantity = _toNumOrNull(container[3]) ?? 0;
+    final delta = (newQuantity - oldQuantity).toDouble();
+    final locationId = container[4] as int?;
+
+    await connection.execute(
+      'UPDATE batch_containers SET quantity = @newQuantity WHERE id = @containerId',
+      substitutionValues: {'newQuantity': newQuantity, 'containerId': containerId},
+    );
+
+    if (locationId != null && delta != 0) {
+      await connection.execute(
+        'UPDATE storage_locations '
+        'SET current_units = current_units + @delta WHERE id = @locationId',
+        substitutionValues: {'delta': delta, 'locationId': locationId},
+      );
+    }
+
+    await connection.execute(
+      'INSERT INTO inventory_transactions '
+      '(organization_id, type, batch_container_id, from_location_id, '
+      'quantity, performed_by, note) '
+      'VALUES (@orgId, \'ADJUSTMENT\', @containerId, @locationId, @delta, '
+      '@performedBy, @note)',
+      substitutionValues: {
+        'orgId': organizationId,
+        'containerId': containerId,
+        'locationId': locationId,
+        'delta': delta,
+        'performedBy': userId,
+        'note': note,
+      },
+    );
+
+    final result = await connection.query(
+      'SELECT bc.id, bc.batch_id, bc.container_barcode, bc.quantity, '
+      'bc.location_id, bc.status '
+      'FROM batch_containers bc WHERE bc.id = @containerId',
+      substitutionValues: {'containerId': containerId},
+    );
+    final state = _containerStateResponse(result.first);
+    state['delta'] = delta;
+    return _jsonResponse(201, jsonEncode(state));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _listInventoryTransactionsHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final batchContainerId =
+        int.tryParse(request.url.queryParameters['batch_container_id'] ?? '');
+    final locationId =
+        int.tryParse(request.url.queryParameters['location_id'] ?? '');
+
+    final conditions = <String>['it.organization_id = @orgId'];
+    final values = <String, dynamic>{'orgId': organizationId};
+    if (batchContainerId != null) {
+      conditions.add('it.batch_container_id = @batchContainerId');
+      values['batchContainerId'] = batchContainerId;
+    }
+    if (locationId != null) {
+      conditions.add(
+          '(it.from_location_id = @locationId OR it.to_location_id = @locationId)');
+      values['locationId'] = locationId;
+    }
+
+    final result = await connection.query(
+      'SELECT it.id, it.organization_id, it.type, it.batch_container_id, '
+      'it.from_location_id, it.to_location_id, it.quantity, it.performed_by, '
+      'it.note, it.created_at, u.full_name '
+      'FROM inventory_transactions it '
+      'JOIN users u ON u.id = it.performed_by '
+      'WHERE ${conditions.join(' AND ')} '
+      'ORDER BY it.created_at DESC, it.id DESC',
+      substitutionValues: values,
+    );
+
+    final transactions = result
+        .map((row) => {
+              'id': row[0],
+              'organization_id': row[1],
+              'type': row[2],
+              'batch_container_id': row[3],
+              'from_location_id': row[4],
+              'to_location_id': row[5],
+              'quantity': _toNumOrNull(row[6]),
+              'performed_by': row[7],
+              'note': row[8],
+              'created_at': (row[9] as DateTime).toUtc().toIso8601String(),
+              'performed_by_name': row[10],
+            })
+        .toList();
+    return _jsonResponse(200, jsonEncode(transactions));
   } finally {
     await connection.close();
   }
