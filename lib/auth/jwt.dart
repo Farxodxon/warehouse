@@ -2,7 +2,7 @@ import 'package:dart_jsonwebtoken/dart_jsonwebtoken.dart';
 import 'package:dotenv/dotenv.dart';
 
 String _secretKey() {
-  final env = DotEnv()..load();
+  final env = DotEnv(includePlatformEnvironment: true)..load();
   return env['JWT_SECRET'] ?? 'insecure-dev-secret';
 }
 

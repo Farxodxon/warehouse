@@ -2,7 +2,7 @@ import 'package:dotenv/dotenv.dart';
 import 'package:postgres/postgres.dart';
 
 Future<PostgreSQLConnection> openConnection() async {
-  final env = DotEnv()..load();
+  final env = DotEnv(includePlatformEnvironment: true)..load();
   final uri = Uri.parse(env['DATABASE_URL']!);
 
   final userInfo = uri.userInfo;
