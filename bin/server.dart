@@ -38,7 +38,8 @@ Future<Response> _healthHandler(Request request) async {
     await connection.execute('SELECT 1');
     await connection.close();
     return _jsonResponse(200, '{"status":"ok","database":"connected"}');
-  } catch (_) {
+  } catch (e, st) {
+    stderr.writeln('DB health check error: $e\n$st');
     return _jsonResponse(503, '{"status":"error","database":"disconnected"}');
   }
 }
