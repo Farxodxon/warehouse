@@ -10,6 +10,7 @@ import 'package:wms_backend/auth/jwt.dart';
 import 'package:wms_backend/auth/middleware.dart';
 import 'package:wms_backend/auth/password.dart';
 import 'package:wms_backend/db/connection.dart';
+import 'package:wms_backend/products/attribute_schema.dart';
 
 final _router = Router()
   ..get('/health', _healthHandler)
@@ -20,7 +21,13 @@ final _router = Router()
   ..post('/warehouses', authMiddleware()(_createWarehouseHandler))
   ..get('/warehouses/<id>', authMiddleware()(_getWarehouseHandler))
   ..post('/warehouses/<id>/users', authMiddleware()(_assignUserToWarehouseHandler))
-  ..get('/warehouses/<id>/users', authMiddleware()(_listWarehouseUsersHandler));
+  ..get('/warehouses/<id>/users', authMiddleware()(_listWarehouseUsersHandler))
+  ..get('/product-categories',
+      authMiddleware()(_listProductCategoriesHandler))
+  ..post('/product-categories',
+      authMiddleware()(_createProductCategoryHandler))
+  ..get('/product-categories/<id>',
+      authMiddleware()(_getProductCategoryHandler));
 
 Response _jsonResponse(int statusCode, String body) {
   return Response(statusCode,
@@ -406,6 +413,142 @@ Future<Response> _listWarehouseUsersHandler(Request request) async {
             })
         .toList();
     return _jsonResponse(200, jsonEncode(users));
+  } finally {
+    await connection.close();
+  }
+}
+
+const _allowedProductTypes = {
+  'raw_material',
+  'semi_finished',
+  'finished_good',
+  'other',
+};
+
+Map<String, dynamic> _rowToProductCategory(List row) {
+  return {
+    'id': row[0],
+    'organization_id': row[1],
+    'name': row[2],
+    'product_type': row[3],
+    'attribute_schema': row[4],
+    'created_at': (row[5] as DateTime).toUtc().toIso8601String(),
+  };
+}
+
+Future<int?> _getUserOrganizationId(
+    dynamic connection, int userId) async {
+  final result = await connection.query(
+    'SELECT organization_id FROM users WHERE id = @userId',
+    substitutionValues: {'userId': userId},
+  );
+  if (result.isEmpty || result.first.first == null) return null;
+  return result.first.first as int;
+}
+
+Future<Response> _listProductCategoriesHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final result = await connection.query(
+      'SELECT id, organization_id, name, product_type, attribute_schema, '
+      'created_at FROM product_categories WHERE organization_id = @orgId '
+      'ORDER BY id',
+      substitutionValues: {'orgId': organizationId},
+    );
+
+    final categories = <Map<String, dynamic>>[];
+    for (final row in result) {
+      categories.add(_rowToProductCategory(row));
+    }
+    return _jsonResponse(200, jsonEncode(categories));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _createProductCategoryHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  if (!await isSuperAdmin(userId)) {
+    return _jsonResponse(403, '{"error":"forbidden"}');
+  }
+
+  final dynamic body;
+  try {
+    body = jsonDecode(await request.readAsString());
+  } catch (_) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final name = body['name'] as String?;
+  final productType = body['product_type'] as String?;
+  final attributeSchema = body['attribute_schema'];
+  if (name == null || name.isEmpty) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+  if (productType == null ||
+      !_allowedProductTypes.contains(productType)) {
+    return _jsonResponse(400, '{"error":"invalid_product_type"}');
+  }
+  if (!isValidAttributeSchema(attributeSchema)) {
+    return _jsonResponse(400, '{"error":"invalid_attribute_schema"}');
+  }
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final result = await connection.query(
+      'INSERT INTO product_categories '
+      '(organization_id, name, product_type, attribute_schema) '
+      'VALUES (@orgId, @name, @productType, @schema::jsonb) '
+      'RETURNING id, organization_id, name, product_type, attribute_schema, created_at',
+      substitutionValues: {
+        'orgId': organizationId,
+        'name': name,
+        'productType': productType,
+        'schema': jsonEncode(attributeSchema),
+      },
+    );
+
+    return _jsonResponse(201, jsonEncode(_rowToProductCategory(result.first)));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _getProductCategoryHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final categoryId = int.parse(request.params['id']!);
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final result = await connection.query(
+      'SELECT id, organization_id, name, product_type, attribute_schema, '
+      'created_at FROM product_categories '
+      'WHERE id = @id AND organization_id = @orgId',
+      substitutionValues: {'id': categoryId, 'orgId': organizationId},
+    );
+    if (result.isEmpty) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+
+return _jsonResponse(
+            200, jsonEncode(_rowToProductCategory(result.first)));
   } finally {
     await connection.close();
   }
