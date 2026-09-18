@@ -12,6 +12,7 @@ import 'package:wms_backend/auth/password.dart';
 import 'package:wms_backend/db/connection.dart';
 import 'package:wms_backend/products/attribute_schema.dart';
 import 'package:wms_backend/products/attribute_values.dart';
+import 'package:wms_backend/products/location_code.dart';
 
 final _router = Router()
   ..get('/health', _healthHandler)
@@ -34,7 +35,17 @@ final _router = Router()
   ..get('/products/barcode/<barcode>',
       authMiddleware()(_getProductByBarcodeHandler))
   ..get('/products/<id>', authMiddleware()(_getProductHandler))
-  ..put('/products/<id>', authMiddleware()(_updateProductHandler));
+  ..put('/products/<id>', authMiddleware()(_updateProductHandler))
+  ..get('/warehouses/<id>/zones', authMiddleware()(_listZonesHandler))
+  ..post('/warehouses/<id>/zones', authMiddleware()(_createZoneHandler))
+  ..get('/warehouses/<id>/storage-locations',
+      authMiddleware()(_listStorageLocationsHandler))
+  ..post('/warehouses/<id>/storage-locations',
+      authMiddleware()(_createStorageLocationHandler))
+  ..get('/storage-locations/code/<code>',
+      authMiddleware()(_getStorageLocationByCodeHandler))
+  ..get('/storage-locations/<id>',
+      authMiddleware()(_getStorageLocationHandler));
 
 Response _jsonResponse(int statusCode, String body) {
   return Response(statusCode,
@@ -947,6 +958,322 @@ Future<Response> _updateProductHandler(Request request) async {
     final row = result.first;
     return _jsonResponse(
         200, jsonEncode(_rowToProduct(row, row[12] as String)));
+  } finally {
+    await connection.close();
+  }
+}
+
+/// Returns an error response if the user cannot view [warehouseId], else null.
+/// Manager access requires super_admin or warehouse_manager role.
+Future<Response?> _checkWarehouseAccess(
+  int userId,
+  int warehouseId, {
+  bool manage = false,
+}) async {
+  final connection = await openConnection();
+  try {
+    final warehouseResult = await connection.query(
+      'SELECT id FROM warehouses WHERE id = @id',
+      substitutionValues: {'id': warehouseId},
+    );
+    if (warehouseResult.isEmpty) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+
+    final isSuper = await isSuperAdmin(userId);
+    final role = await getUserRoleForWarehouse(userId, warehouseId);
+    if (manage) {
+      if (!isSuper && role != 'warehouse_manager') {
+        return _jsonResponse(403, '{"error":"forbidden"}');
+      }
+    } else {
+      if (!isSuper && role == null) {
+        return _jsonResponse(403, '{"error":"forbidden"}');
+      }
+    }
+    return null;
+  } finally {
+    await connection.close();
+  }
+}
+
+Map<String, dynamic> _rowToZone(List row) {
+  return {
+    'id': row[0],
+    'warehouse_id': row[1],
+    'name': row[2],
+    'zone_type': row[3],
+    'created_at': (row[4] as DateTime).toUtc().toIso8601String(),
+  };
+}
+
+Map<String, dynamic> _rowToStorageLocation(List row) {
+  return {
+    'id': row[0],
+    'warehouse_id': row[1],
+    'zone_id': row[2],
+    'aisle': row[3],
+    'rack': row[4],
+    'shelf': row[5],
+    'bin': row[6],
+    'code': row[7],
+    'capacity_units': _toNumOrNull(row[8]),
+    'current_units': _toNumOrNull(row[9]),
+    'created_at': (row[10] as DateTime).toUtc().toIso8601String(),
+    'zone_name': row[11],
+  };
+}
+
+const _storageLocationSelect = '''
+SELECT sl.id, sl.warehouse_id, sl.zone_id, sl.aisle, sl.rack, sl.shelf, sl.bin,
+       sl.code, sl.capacity_units, sl.current_units, sl.created_at, z.name
+FROM storage_locations sl
+LEFT JOIN zones z ON z.id = sl.zone_id
+''';
+
+const _storageLocationDetailSelect = '''
+SELECT sl.id, sl.warehouse_id, sl.zone_id, sl.aisle, sl.rack, sl.shelf, sl.bin,
+       sl.code, sl.capacity_units, sl.current_units, sl.created_at, z.name, w.name
+FROM storage_locations sl
+LEFT JOIN zones z ON z.id = sl.zone_id
+JOIN warehouses w ON w.id = sl.warehouse_id
+''';
+
+Future<Response> _listZonesHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final warehouseId = int.parse(request.params['id']!);
+
+  final access = await _checkWarehouseAccess(userId, warehouseId);
+  if (access != null) return access;
+
+  final connection = await openConnection();
+  try {
+    final result = await connection.query(
+      'SELECT id, warehouse_id, name, zone_type, created_at '
+      'FROM zones WHERE warehouse_id = @warehouseId ORDER BY id',
+      substitutionValues: {'warehouseId': warehouseId},
+    );
+
+    final zones = result.map((row) => _rowToZone(row)).toList();
+    return _jsonResponse(200, jsonEncode(zones));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _createZoneHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final warehouseId = int.parse(request.params['id']!);
+
+  final access = await _checkWarehouseAccess(userId, warehouseId, manage: true);
+  if (access != null) return access;
+
+  final dynamic body;
+  try {
+    body = jsonDecode(await request.readAsString());
+  } catch (_) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final name = body['name'] as String?;
+  final zoneType = body['zone_type'] as String?;
+  if (name == null || name.isEmpty) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final connection = await openConnection();
+  try {
+    final result = await connection.query(
+      'INSERT INTO zones (warehouse_id, name, zone_type) '
+      'VALUES (@warehouseId, @name, @zoneType) '
+      'RETURNING id, warehouse_id, name, zone_type, created_at',
+      substitutionValues: {
+        'warehouseId': warehouseId,
+        'name': name,
+        'zoneType': zoneType,
+      },
+    );
+    return _jsonResponse(201, jsonEncode(_rowToZone(result.first)));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _listStorageLocationsHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final warehouseId = int.parse(request.params['id']!);
+
+  final access = await _checkWarehouseAccess(userId, warehouseId);
+  if (access != null) return access;
+
+  final zoneId = int.tryParse(request.url.queryParameters['zone_id'] ?? '');
+
+  final connection = await openConnection();
+  try {
+    final conditions = <String>['sl.warehouse_id = @warehouseId'];
+    final values = <String, dynamic>{'warehouseId': warehouseId};
+    if (zoneId != null) {
+      conditions.add('sl.zone_id = @zoneId');
+      values['zoneId'] = zoneId;
+    }
+
+    final result = await connection.query(
+      '$_storageLocationSelect WHERE ${conditions.join(' AND ')} ORDER BY sl.id',
+      substitutionValues: values,
+    );
+
+    final locations =
+        result.map((row) => _rowToStorageLocation(row)).toList();
+    return _jsonResponse(200, jsonEncode(locations));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _createStorageLocationHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final warehouseId = int.parse(request.params['id']!);
+
+  final access =
+      await _checkWarehouseAccess(userId, warehouseId, manage: true);
+  if (access != null) return access;
+
+  final dynamic body;
+  try {
+    body = jsonDecode(await request.readAsString());
+  } catch (_) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final zoneId = body['zone_id'] as int?;
+  final aisle = body['aisle'] as String?;
+  final rack = body['rack'] as String?;
+  final shelf = body['shelf'] as String?;
+  final bin = body['bin'] as String?;
+  final capacityUnits = body['capacity_units'] as num?;
+  if (aisle == null ||
+      aisle.isEmpty ||
+      rack == null ||
+      rack.isEmpty ||
+      shelf == null ||
+      shelf.isEmpty ||
+      bin == null ||
+      bin.isEmpty) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final code = buildLocationCode(aisle, rack, shelf, bin);
+
+  final connection = await openConnection();
+  try {
+    if (zoneId != null) {
+      final zoneResult = await connection.query(
+        'SELECT 1 FROM zones WHERE id = @zoneId AND warehouse_id = @warehouseId',
+        substitutionValues: {'zoneId': zoneId, 'warehouseId': warehouseId},
+      );
+      if (zoneResult.isEmpty) {
+        return _jsonResponse(404, '{"error":"not_found"}');
+      }
+    }
+
+    final existing = await connection.query(
+      'SELECT 1 FROM storage_locations '
+      'WHERE warehouse_id = @warehouseId AND code = @code',
+      substitutionValues: {'warehouseId': warehouseId, 'code': code},
+    );
+    if (existing.isNotEmpty) {
+      return _jsonResponse(409, '{"error":"location_already_exists"}');
+    }
+
+    final result = await connection.query(
+      'INSERT INTO storage_locations '
+      '(warehouse_id, zone_id, aisle, rack, shelf, bin, code, capacity_units) '
+      'VALUES (@warehouseId, @zoneId, @aisle, @rack, @shelf, @bin, @code, '
+      '@capacityUnits) '
+      'RETURNING id',
+      substitutionValues: {
+        'warehouseId': warehouseId,
+        'zoneId': zoneId,
+        'aisle': aisle,
+        'rack': rack,
+        'shelf': shelf,
+        'bin': bin,
+        'code': code,
+        'capacityUnits': capacityUnits,
+      },
+    );
+    final locationId = result.first.first as int;
+
+    final fullResult = await connection.query(
+      '$_storageLocationSelect WHERE sl.id = @id',
+      substitutionValues: {'id': locationId},
+    );
+    return _jsonResponse(
+        201, jsonEncode(_rowToStorageLocation(fullResult.first)));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _getStorageLocationHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final locationId = int.parse(request.params['id']!);
+
+  final connection = await openConnection();
+  try {
+    final result = await connection.query(
+      '$_storageLocationDetailSelect WHERE sl.id = @id',
+      substitutionValues: {'id': locationId},
+    );
+    if (result.isEmpty) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+
+    final row = result.first;
+    final isSuper = await isSuperAdmin(userId);
+    final warehouseId = row[1] as int;
+    final role = await getUserRoleForWarehouse(userId, warehouseId);
+    if (!isSuper && role == null) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+
+    final location = _rowToStorageLocation(row);
+    location['warehouse_name'] = row[12];
+    return _jsonResponse(200, jsonEncode(location));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _getStorageLocationByCodeHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final code = request.params['code']!;
+
+  final connection = await openConnection();
+  try {
+    final isSuper = await isSuperAdmin(userId);
+
+    final result = await connection.query(
+      '$_storageLocationDetailSelect '
+      'LEFT JOIN user_warehouse_access uwa '
+      '  ON uwa.warehouse_id = sl.warehouse_id AND uwa.user_id = @userId '
+      'WHERE sl.code = @code '
+      'AND (@isSuper = TRUE OR uwa.id IS NOT NULL) '
+      'ORDER BY sl.id LIMIT 1',
+      substitutionValues: {
+        'code': code,
+        'userId': userId,
+        'isSuper': isSuper,
+      },
+    );
+    if (result.isEmpty) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+
+    final row = result.first;
+    final location = _rowToStorageLocation(row);
+    location['warehouse_name'] = row[12];
+    return _jsonResponse(200, jsonEncode(location));
   } finally {
     await connection.close();
   }
