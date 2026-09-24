@@ -12,6 +12,7 @@ import 'package:wms_backend/auth/password.dart';
 import 'package:wms_backend/db/connection.dart';
 import 'package:wms_backend/inventory/expiry_alerts.dart';
 import 'package:wms_backend/inventory/fefo_planner.dart';
+import 'package:wms_backend/inventory/quality_workflow.dart';
 import 'package:wms_backend/products/attribute_schema.dart';
 import 'package:wms_backend/products/attribute_values.dart';
 import 'package:wms_backend/products/batch_validation.dart';
@@ -66,6 +67,12 @@ final _router = Router()
       authMiddleware()(_createBatchContainerHandler))
   ..get('/batches/<batchId>/containers',
       authMiddleware()(_listBatchContainersHandler))
+  ..post('/batches/<id>/quality-status',
+      authMiddleware()(_setBatchQualityStatusHandler))
+  ..get('/batches/<id>/quality-history',
+      authMiddleware()(_batchQualityHistoryHandler))
+  ..get('/quality/pending',
+      authMiddleware()(_qualityPendingHandler))
   ..get('/containers/barcode/<barcode>',
       authMiddleware()(_getContainerByBarcodeHandler))
   ..post('/inventory/out', authMiddleware()(_inventoryOutHandler))
@@ -1397,7 +1404,8 @@ Future<Response> _createBatchHandler(Request request) async {
   final lotNumber = body['lot_number'] as String?;
   final manufactureDate = body['manufacture_date'] as String?;
   final expiryDate = body['expiry_date'] as String?;
-  final qualityStatus = body['quality_status'] as String? ?? 'approved';
+  final qualityStatus =
+      body['quality_status'] as String? ?? 'pending_inspection';
   if (lotNumber == null || lotNumber.isEmpty) {
     return _jsonResponse(400, '{"error":"invalid_request"}');
   }
@@ -1602,6 +1610,198 @@ Future<Response> _listBatchContainersHandler(Request request) async {
   }
 }
 
+Future<Response> _setBatchQualityStatusHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  if (!await _canManageProducts(userId)) {
+    return _jsonResponse(403, '{"error":"forbidden"}');
+  }
+
+  final batchId = int.parse(request.params['id']!);
+
+  final dynamic body;
+  try {
+    body = jsonDecode(await request.readAsString());
+  } catch (_) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final toStatus = body['status'] as String?;
+  final note = body['note'] as String?;
+  if (toStatus == null || !isValidQualityStatus(toStatus)) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+  if (note == null || note.trim().isEmpty) {
+    return _jsonResponse(400, '{"error":"note_required"}');
+  }
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final batchResult = await connection.query(
+      'SELECT b.quality_status FROM batches b '
+      'JOIN products p ON p.id = b.product_id '
+      'WHERE b.id = @batchId AND p.organization_id = @orgId',
+      substitutionValues: {'batchId': batchId, 'orgId': organizationId},
+    );
+    if (batchResult.isEmpty) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+    final fromStatus = batchResult.first.first as String;
+
+    if (!isValidTransition(fromStatus, toStatus)) {
+      return _jsonResponse(
+        400,
+        jsonEncode({
+          'error': 'invalid_transition',
+          'from': fromStatus,
+          'to': toStatus,
+        }),
+      );
+    }
+
+    await connection.transaction((ctx) async {
+      await ctx.execute(
+        'UPDATE batches SET quality_status = @toStatus WHERE id = @batchId',
+        substitutionValues: {'toStatus': toStatus, 'batchId': batchId},
+      );
+      await ctx.execute(
+        'INSERT INTO quality_status_history '
+        '(batch_id, from_status, to_status, note, changed_by) '
+        'VALUES (@batchId, @fromStatus, @toStatus, @note, @changedBy)',
+        substitutionValues: {
+          'batchId': batchId,
+          'fromStatus': fromStatus,
+          'toStatus': toStatus,
+          'note': note.trim(),
+          'changedBy': userId,
+        },
+      );
+    });
+
+    final result = await connection.query(
+      'SELECT b.id, b.organization_id, b.product_id, b.lot_number, '
+      'b.manufacture_date, b.expiry_date, b.received_date, b.quality_status, '
+      'b.created_at, '
+      'COALESCE((SELECT SUM(bc.quantity) FROM batch_containers bc '
+      'WHERE bc.batch_id = b.id AND bc.status = \'active\'), 0) '
+      'FROM batches b WHERE b.id = @batchId',
+      substitutionValues: {'batchId': batchId},
+    );
+    return _jsonResponse(
+        200, jsonEncode(_rowToBatch(result.first, totalQuantity: result.first[9])));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _batchQualityHistoryHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final batchId = int.parse(request.params['id']!);
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final batchCheck =
+        await _requireBatchInOrg(connection, batchId, organizationId);
+    if (batchCheck != null) return batchCheck;
+
+    final result = await connection.query(
+      'SELECT qsh.id, qsh.batch_id, qsh.from_status, qsh.to_status, qsh.note, '
+      'qsh.changed_by, qsh.changed_at, u.full_name '
+      'FROM quality_status_history qsh '
+      'JOIN users u ON u.id = qsh.changed_by '
+      'WHERE qsh.batch_id = @batchId '
+      'ORDER BY qsh.changed_at DESC, qsh.id DESC',
+      substitutionValues: {'batchId': batchId},
+    );
+
+    final history = result
+        .map((row) => {
+              'id': row[0],
+              'batch_id': row[1],
+              'from_status': row[2],
+              'to_status': row[3],
+              'note': row[4],
+              'changed_by': row[5],
+              'changed_at': (row[6] as DateTime).toUtc().toIso8601String(),
+              'changed_by_name': row[7],
+            })
+        .toList();
+    return _jsonResponse(200, jsonEncode(history));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _qualityPendingHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final roleResult = await connection.query(
+      'SELECT role FROM users WHERE id = @userId',
+      substitutionValues: {'userId': userId},
+    );
+    final isSuperAdmin =
+        roleResult.isNotEmpty && roleResult.first.first == 'super_admin';
+
+    final warehouseClause = isSuperAdmin
+        ? ''
+        : '''
+      AND EXISTS (
+        SELECT 1 FROM batch_containers bc2
+        JOIN storage_locations sl2 ON sl2.id = bc2.location_id
+        JOIN user_warehouse_access uwa ON uwa.warehouse_id = sl2.warehouse_id
+        WHERE bc2.batch_id = b.id AND bc2.status = 'active'
+          AND uwa.user_id = @userId
+      )''';
+
+    final result = await connection.query(
+      '''
+      SELECT b.id, b.product_id, p.name, b.lot_number, b.quality_status,
+             b.received_date,
+             COALESCE((SELECT SUM(bc.quantity) FROM batch_containers bc
+             WHERE bc.batch_id = b.id AND bc.status = 'active'), 0)
+      FROM batches b
+      JOIN products p ON p.id = b.product_id
+      WHERE b.organization_id = @organizationId
+        AND b.quality_status IN ('pending_inspection', 'quarantine')
+        $warehouseClause
+      ORDER BY b.received_date ASC, b.id
+      ''',
+      substitutionValues: {'organizationId': organizationId, 'userId': userId},
+    );
+
+    final batches = result
+        .map((row) => {
+              'batch_id': row[0],
+              'product_id': row[1],
+              'product_name': row[2],
+              'lot_number': row[3],
+              'quality_status': row[4],
+              'received_date': _dateToString(row[5]),
+              'total_active_quantity': _toNumOrNull(row[6]),
+            })
+        .toList();
+    return _jsonResponse(200, jsonEncode(batches));
+  } finally {
+    await connection.close();
+  }
+}
+
 Future<Response> _getContainerByBarcodeHandler(Request request) async {
   final userId = request.context['userId'] as int;
   final barcode = request.params['barcode']!;
@@ -1784,6 +1984,24 @@ Future<Response> _inventoryOutHandler(Request request) async {
     final container = await _findContainerInOrg(connection, containerId, organizationId);
     if (container == null) {
       return _jsonResponse(404, '{"error":"not_found"}');
+    }
+
+    final batchStatusResult = await connection.query(
+      'SELECT b.quality_status FROM batches b '
+      'JOIN batch_containers bc ON bc.batch_id = b.id '
+      'WHERE bc.id = @batchContainerId',
+      substitutionValues: {'batchContainerId': containerId},
+    );
+    final qualityStatus =
+        batchStatusResult.isNotEmpty ? batchStatusResult.first.first as String : '';
+    if (qualityStatus != 'approved') {
+      return _jsonResponse(
+        400,
+        jsonEncode({
+          'error': 'batch_not_approved',
+          'quality_status': qualityStatus,
+        }),
+      );
     }
 
     final currentQuantity = _toNumOrNull(container[3]) ?? 0;
