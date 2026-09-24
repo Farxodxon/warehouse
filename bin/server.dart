@@ -10,6 +10,7 @@ import 'package:wms_backend/auth/jwt.dart';
 import 'package:wms_backend/auth/middleware.dart';
 import 'package:wms_backend/auth/password.dart';
 import 'package:wms_backend/db/connection.dart';
+import 'package:wms_backend/inventory/fefo_planner.dart';
 import 'package:wms_backend/products/attribute_schema.dart';
 import 'package:wms_backend/products/attribute_values.dart';
 import 'package:wms_backend/products/batch_validation.dart';
@@ -36,6 +37,10 @@ final _router = Router()
   ..get('/products/barcode/<barcode>',
       authMiddleware()(_getProductByBarcodeHandler))
   ..get('/products/<id>', authMiddleware()(_getProductHandler))
+  ..get('/products/<productId>/fefo-plan',
+      authMiddleware()(_fefoPlanHandler))
+  ..post('/products/<productId>/fefo-out',
+      authMiddleware()(_fefoOutHandler))
   ..put('/products/<id>', authMiddleware()(_updateProductHandler))
   ..get('/warehouses/<id>/zones', authMiddleware()(_listZonesHandler))
   ..post('/warehouses/<id>/zones', authMiddleware()(_createZoneHandler))
@@ -1704,6 +1709,19 @@ Future<List?> _findContainerInOrg(
   return result.first;
 }
 
+/// Returns a 404 response if [productId] does not belong to [organizationId].
+Future<Response?> _requireProductInOrg(
+    dynamic connection, int productId, int organizationId) async {
+  final result = await connection.query(
+    'SELECT 1 FROM products WHERE id = @productId AND organization_id = @orgId',
+    substitutionValues: {'productId': productId, 'orgId': organizationId},
+  );
+  if (result.isEmpty) {
+    return _jsonResponse(404, '{"error":"not_found"}');
+  }
+  return null;
+}
+
 /// Returns storage_location id if it exists and belongs to user's organization
 /// (via its warehouse), else null.
 Future<Response?> _requireLocationInOrg(
@@ -2045,6 +2063,156 @@ Future<Response> _listInventoryTransactionsHandler(Request request) async {
             })
         .toList();
     return _jsonResponse(200, jsonEncode(transactions));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _fefoPlanHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final productId = int.parse(request.params['productId']!);
+
+  final quantity = num.tryParse(request.url.queryParameters['quantity'] ?? '');
+  if (quantity == null || quantity <= 0) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final productCheck =
+        await _requireProductInOrg(connection, productId, organizationId);
+    if (productCheck != null) return productCheck;
+
+    final plan = await buildFefoPlan(
+      connection,
+      userId: userId,
+      organizationId: organizationId,
+      productId: productId,
+      requested: quantity,
+    );
+
+    return _jsonResponse(200, jsonEncode(plan.toJson()));
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _fefoOutHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  if (!await _canOperateInventory(userId)) {
+    return _jsonResponse(403, '{"error":"forbidden"}');
+  }
+
+  final productId = int.parse(request.params['productId']!);
+
+  final dynamic body;
+  try {
+    body = jsonDecode(await request.readAsString());
+  } catch (_) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final quantity = body['quantity'] as num?;
+  final note = body['note'] as String?;
+  if (quantity == null || quantity <= 0) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final productCheck =
+        await _requireProductInOrg(connection, productId, organizationId);
+    if (productCheck != null) return productCheck;
+
+    final executed = <Map<String, dynamic>>[];
+    try {
+      await connection.transaction((ctx) async {
+        final plan = await buildFefoPlan(
+          ctx,
+          userId: userId,
+          organizationId: organizationId,
+          productId: productId,
+          requested: quantity,
+        );
+        if (!plan.sufficient) {
+          throw FefoInsufficientStock(plan.covered);
+        }
+
+        final barcodes = plan.plan.map((e) => e.containerBarcode).join(', ');
+        final fullNote = [
+          if (note != null && note.trim().isNotEmpty) note.trim(),
+          '(FEFO avtomatik: $barcodes)',
+        ].join(' ');
+
+        for (final item in plan.plan) {
+          await ctx.execute(
+            'UPDATE batch_containers SET quantity = quantity - @qty '
+            'WHERE id = @containerId',
+            substitutionValues: {
+              'qty': item.takeQuantity,
+              'containerId': item.containerId,
+            },
+          );
+          if (item.locationId != null) {
+            await ctx.execute(
+              'UPDATE storage_locations '
+              'SET current_units = current_units - @qty WHERE id = @locationId',
+              substitutionValues: {
+                'qty': item.takeQuantity,
+                'locationId': item.locationId,
+              },
+            );
+          }
+          await ctx.execute(
+            'INSERT INTO inventory_transactions '
+            '(organization_id, type, batch_container_id, from_location_id, '
+            'quantity, performed_by, note) '
+            'VALUES (@orgId, \'OUT\', @containerId, @locationId, @qty, '
+            '@performedBy, @note)',
+            substitutionValues: {
+              'orgId': organizationId,
+              'containerId': item.containerId,
+              'locationId': item.locationId,
+              'qty': item.takeQuantity,
+              'performedBy': userId,
+              'note': fullNote,
+            },
+          );
+        }
+
+        for (final item in plan.plan) {
+          final row = await ctx.query(
+            'SELECT quantity FROM batch_containers WHERE id = @containerId',
+            substitutionValues: {'containerId': item.containerId},
+          );
+          final entry = item.toJson();
+          entry['remaining_quantity'] = _toNumOrNull(row.first[0]);
+          executed.add(entry);
+        }
+      });
+    } on FefoInsufficientStock catch (e) {
+      return _jsonResponse(
+        400,
+        jsonEncode({'error': 'insufficient_stock', 'available': e.available}),
+      );
+    }
+
+    return _jsonResponseBody(201, {
+      'requested': quantity,
+      'covered': quantity,
+      'sufficient': true,
+      'plan': executed,
+    });
   } finally {
     await connection.close();
   }
