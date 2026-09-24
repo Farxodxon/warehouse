@@ -10,6 +10,7 @@ import 'package:wms_backend/auth/jwt.dart';
 import 'package:wms_backend/auth/middleware.dart';
 import 'package:wms_backend/auth/password.dart';
 import 'package:wms_backend/db/connection.dart';
+import 'package:wms_backend/inventory/expiry_alerts.dart';
 import 'package:wms_backend/inventory/fefo_planner.dart';
 import 'package:wms_backend/products/attribute_schema.dart';
 import 'package:wms_backend/products/attribute_values.dart';
@@ -41,6 +42,9 @@ final _router = Router()
       authMiddleware()(_fefoPlanHandler))
   ..post('/products/<productId>/fefo-out',
       authMiddleware()(_fefoOutHandler))
+  ..get('/alerts/expiring-batches',
+      authMiddleware()(_expiringBatchesHandler))
+  ..get('/alerts/summary', authMiddleware()(_alertsSummaryHandler))
   ..put('/products/<id>', authMiddleware()(_updateProductHandler))
   ..get('/warehouses/<id>/zones', authMiddleware()(_listZonesHandler))
   ..post('/warehouses/<id>/zones', authMiddleware()(_createZoneHandler))
@@ -2212,6 +2216,62 @@ Future<Response> _fefoOutHandler(Request request) async {
       'covered': quantity,
       'sufficient': true,
       'plan': executed,
+    });
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _expiringBatchesHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+
+  final rawDays = request.url.queryParameters['days'];
+  final days = rawDays != null ? int.tryParse(rawDays) : 30;
+  if (days == null || days < 0) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final items = await buildExpiryAlerts(
+      connection,
+      userId: userId,
+      organizationId: organizationId,
+      days: days,
+    );
+
+    return _jsonResponseBody(200, {'days': days, 'items': items});
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _alertsSummaryHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final items = await buildExpiryAlerts(
+      connection,
+      userId: userId,
+      organizationId: organizationId,
+      days: 30,
+    );
+
+    return _jsonResponseBody(200, {
+      'expired_count': items.where((e) => e['urgency'] == 'expired').length,
+      'critical_count': items.where((e) => e['urgency'] == 'critical').length,
+      'warning_count': items.where((e) => e['urgency'] == 'warning').length,
     });
   } finally {
     await connection.close();
