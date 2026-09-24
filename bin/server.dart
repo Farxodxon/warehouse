@@ -17,6 +17,8 @@ import 'package:wms_backend/products/attribute_schema.dart';
 import 'package:wms_backend/products/attribute_values.dart';
 import 'package:wms_backend/products/batch_validation.dart';
 import 'package:wms_backend/products/location_code.dart';
+import 'package:wms_backend/reports/stock_report.dart';
+import 'package:wms_backend/reports/transactions_report.dart';
 
 final _router = Router()
   ..get('/health', _healthHandler)
@@ -80,7 +82,11 @@ final _router = Router()
   ..post('/inventory/adjustment',
       authMiddleware()(_inventoryAdjustmentHandler))
   ..get('/inventory/transactions',
-      authMiddleware()(_listInventoryTransactionsHandler));
+      authMiddleware()(_listInventoryTransactionsHandler))
+  ..get('/reports/stock.xlsx',
+      authMiddleware()(_stockReportHandler))
+  ..get('/reports/transactions.xlsx',
+      authMiddleware()(_transactionsReportHandler));
 
 Response _jsonResponse(int statusCode, String body) {
   return Response(statusCode,
@@ -2494,6 +2500,91 @@ Future<Response> _alertsSummaryHandler(Request request) async {
   } finally {
     await connection.close();
   }
+}
+
+const _xlsxContentType =
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+Future<Response> _stockReportHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  if (!await _canManageProducts(userId)) {
+    return _jsonResponse(403, '{"error":"forbidden"}');
+  }
+
+  final warehouseId =
+      int.tryParse(request.url.queryParameters['warehouse_id'] ?? '');
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final bytes = await buildStockReport(
+      connection,
+      userId: userId,
+      organizationId: organizationId,
+      warehouseId: warehouseId,
+    );
+
+    final today = DateTime.now().toIso8601String().split('T').first;
+    return Response.ok(bytes, headers: {
+      'content-type': _xlsxContentType,
+      'content-disposition': 'attachment; filename="qoldiq-hisoboti-$today.xlsx"',
+    });
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _transactionsReportHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  if (!await _canManageProducts(userId)) {
+    return _jsonResponse(403, '{"error":"forbidden"}');
+  }
+
+  final from = request.url.queryParameters['from'];
+  final to = request.url.queryParameters['to'];
+  if (!_isIsoDate(from) || !_isIsoDate(to)) {
+    return _jsonResponse(400, '{"error":"date_range_required"}');
+  }
+  final fromDate = from!;
+  final toDate = to!;
+
+  final warehouseId =
+      int.tryParse(request.url.queryParameters['warehouse_id'] ?? '');
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final bytes = await buildTransactionsReport(
+      connection,
+      userId: userId,
+      organizationId: organizationId,
+      from: fromDate,
+      to: toDate,
+      warehouseId: warehouseId,
+    );
+
+    return Response.ok(bytes, headers: {
+      'content-type': _xlsxContentType,
+      'content-disposition': 'attachment; filename="harakatlar-$fromDate-$toDate.xlsx"',
+    });
+  } finally {
+    await connection.close();
+  }
+}
+
+bool _isIsoDate(String? value) {
+  if (value == null || !RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(value)) {
+    return false;
+  }
+  return DateTime.tryParse(value) != null;
 }
 
 void main(List<String> args) async {

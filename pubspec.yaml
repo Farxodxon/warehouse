@@ -11,6 +11,7 @@ dependencies:
   dart_jsonwebtoken: ^2.17.0
   dbcrypt: ^2.0.0
   dotenv: ^4.2.0
+  excel: ^4.0.6
   postgres: ^2.6.3
   shelf: ^1.4.0
   shelf_router: ^1.1.0
