@@ -2,9 +2,11 @@ services:
   - type: web
     name: eclair-wms-backend
     runtime: docker
+    region: frankfurt
     dockerfilePath: ./Dockerfile
     dockerContext: .
     plan: free
+    autoDeploy: true
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL

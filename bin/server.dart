@@ -24,11 +24,15 @@ final _router = Router()
   ..get('/health', _healthHandler)
   ..post('/setup', _setupHandler)
   ..post('/login', _loginHandler)
+  ..get('/public/stock-summary', _publicStockSummaryHandler)
   ..get('/me', authMiddleware()(_meHandler))
   ..get('/warehouses', authMiddleware()(_listWarehousesHandler))
   ..post('/warehouses', authMiddleware()(_createWarehouseHandler))
   ..get('/warehouses/<id>', authMiddleware()(_getWarehouseHandler))
   ..post('/warehouses/<id>/users', authMiddleware()(_assignUserToWarehouseHandler))
+  ..post('/warehouses/<id>/operators', authMiddleware()(_createOperatorHandler))
+  ..put('/warehouses/<id>/operators/<userId>',
+      authMiddleware()(_updateOperatorHandler))
   ..get('/warehouses/<id>/users', authMiddleware()(_listWarehouseUsersHandler))
   ..get('/product-categories',
       authMiddleware()(_listProductCategoriesHandler))
@@ -129,8 +133,10 @@ Future<Response> _setupHandler(Request request) async {
 
       final hash = hashPassword(password);
       final result = await connection.query(
-        'INSERT INTO users (email, password_hash, full_name, role) '
-        'VALUES (@email, @hash, @fullName, @role) '
+        'INSERT INTO users (email, password_hash, full_name, role, '
+        'organization_id) '
+        'VALUES (@email, @hash, @fullName, @role, '
+        '(SELECT id FROM organizations ORDER BY id LIMIT 1)) '
         'RETURNING id',
         substitutionValues: {
           'email': email,
@@ -360,6 +366,196 @@ const _allowedWarehouseRoles = [
   'operator',
   'viewer',
 ];
+
+Future<Response> _updateOperatorHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final warehouseId = int.parse(request.params['id']!);
+  final targetUserId = int.parse(request.params['userId']!);
+
+  final dynamic body;
+  try {
+    body = jsonDecode(await request.readAsString());
+  } catch (_) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final email = (body['email'] as String?)?.trim();
+  final fullName = (body['full_name'] as String?)?.trim();
+  final password = body['password'] as String?;
+  if (email == null || email.isEmpty || fullName == null || fullName.isEmpty) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final connection = await openConnection();
+  try {
+    final isSuper = await isSuperAdmin(userId);
+    final managerRole = await getUserRoleForWarehouse(userId, warehouseId);
+    if (!isSuper && managerRole != 'warehouse_manager') {
+      return _jsonResponse(403, '{"error":"forbidden"}');
+    }
+
+    final targetResult = await connection.query(
+      'SELECT uwa.role FROM user_warehouse_access uwa '
+      'WHERE uwa.user_id = @userId AND uwa.warehouse_id = @warehouseId',
+      substitutionValues: {
+        'userId': targetUserId,
+        'warehouseId': warehouseId,
+      },
+    );
+    if (targetResult.isEmpty || targetResult.first[0] != 'operator') {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+
+    final orgResult = await connection.query(
+      'SELECT organization_id FROM warehouses WHERE id = @id',
+      substitutionValues: {'id': warehouseId},
+    );
+    final warehouseOrgId =
+        (orgResult.isEmpty ? null : orgResult.first.first) as int?;
+    if (warehouseOrgId != null) {
+      await connection.query(
+        'UPDATE users SET organization_id = @orgId '
+        'WHERE id = @targetUserId AND organization_id IS NULL',
+        substitutionValues: {
+          'orgId': warehouseOrgId,
+          'targetUserId': targetUserId,
+        },
+      );
+    }
+
+    final existingEmail = await connection.query(
+      'SELECT 1 FROM users WHERE email = @email AND id != @userId',
+      substitutionValues: {'email': email, 'userId': targetUserId},
+    );
+    if (existingEmail.isNotEmpty) {
+      return _jsonResponse(409, '{"error":"email_already_exists"}');
+    }
+
+    if (password != null && password.isNotEmpty) {
+      final hash = hashPassword(password);
+      await connection.execute(
+        'UPDATE users SET email = @email, full_name = @fullName, '
+        'password_hash = @hash WHERE id = @userId',
+        substitutionValues: {
+          'email': email,
+          'fullName': fullName,
+          'hash': hash,
+          'userId': targetUserId,
+        },
+      );
+    } else {
+      await connection.execute(
+        'UPDATE users SET email = @email, full_name = @fullName '
+        'WHERE id = @userId',
+        substitutionValues: {
+          'email': email,
+          'fullName': fullName,
+          'userId': targetUserId,
+        },
+      );
+    }
+
+    return _jsonResponseBody(200, {
+      'id': targetUserId,
+      'email': email,
+      'full_name': fullName,
+      'role': 'operator',
+      'warehouse_id': warehouseId,
+    });
+  } finally {
+    await connection.close();
+  }
+}
+
+Future<Response> _createOperatorHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final warehouseId = int.parse(request.params['id']!);
+
+  final dynamic body;
+  try {
+    body = jsonDecode(await request.readAsString());
+  } catch (_) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final email = (body['email'] as String?)?.trim();
+  final password = body['password'] as String?;
+  final fullName = (body['full_name'] as String?)?.trim();
+  if (email == null ||
+      email.isEmpty ||
+      password == null ||
+      password.isEmpty ||
+      fullName == null ||
+      fullName.isEmpty) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final connection = await openConnection();
+  try {
+    final warehouseResult = await connection.query(
+      'SELECT id, organization_id FROM warehouses WHERE id = @id',
+      substitutionValues: {'id': warehouseId},
+    );
+    if (warehouseResult.isEmpty) {
+      return _jsonResponse(404, '{"error":"not_found"}');
+    }
+
+    final isSuper = await isSuperAdmin(userId);
+    final managerRole = await getUserRoleForWarehouse(userId, warehouseId);
+    if (!isSuper && managerRole != 'warehouse_manager') {
+      return _jsonResponse(403, '{"error":"forbidden"}');
+    }
+
+    final existingEmail = await connection.query(
+      'SELECT 1 FROM users WHERE email = @email',
+      substitutionValues: {'email': email},
+    );
+    if (existingEmail.isNotEmpty) {
+      return _jsonResponse(409, '{"error":"email_already_exists"}');
+    }
+
+    var organizationId = warehouseResult.first[1] as int?;
+    organizationId ??= await _getUserOrganizationId(connection, userId);
+
+    final hash = hashPassword(password);
+    late int newUserId;
+    await connection.transaction((ctx) async {
+      final userResult = await ctx.query(
+        'INSERT INTO users (email, password_hash, full_name, role, '
+        'organization_id) '
+        "VALUES (@email, @hash, @fullName, 'operator', "
+        '(SELECT organization_id FROM warehouses WHERE id = @warehouseId)) '
+        'RETURNING id',
+        substitutionValues: {
+          'email': email,
+          'hash': hash,
+          'fullName': fullName,
+          'warehouseId': warehouseId,
+        },
+      );
+      newUserId = userResult.first.first as int;
+
+      await ctx.execute(
+        'INSERT INTO user_warehouse_access (user_id, warehouse_id, role) '
+        "VALUES (@userId, @warehouseId, 'operator')",
+        substitutionValues: {
+          'userId': newUserId,
+          'warehouseId': warehouseId,
+        },
+      );
+    });
+
+    return _jsonResponseBody(201, {
+      'id': newUserId,
+      'email': email,
+      'full_name': fullName,
+      'role': 'operator',
+      'warehouse_id': warehouseId,
+    });
+  } finally {
+    await connection.close();
+  }
+}
 
 Future<Response> _assignUserToWarehouseHandler(Request request) async {
   final userId = request.context['userId'] as int;
@@ -613,7 +809,12 @@ return _jsonResponse(
   }
 }
 
-Map<String, dynamic> _rowToProduct(List row, String categoryName) {
+Map<String, dynamic> _rowToProduct(
+  List row,
+  String categoryName, {
+  String? defaultContainerType,
+  num? defaultUnitWeightKg,
+}) {
   return {
     'id': row[0],
     'organization_id': row[1],
@@ -628,6 +829,10 @@ Map<String, dynamic> _rowToProduct(List row, String categoryName) {
     'attributes': row[10],
     'created_at': (row[11] as DateTime).toUtc().toIso8601String(),
     'category_name': categoryName,
+    if (defaultContainerType != null)
+      'default_container_type': defaultContainerType,
+    if (defaultUnitWeightKg != null)
+      'default_unit_weight_kg': defaultUnitWeightKg,
   };
 }
 
@@ -681,6 +886,31 @@ Future<bool> _canOperateInventory(int userId) async {
   }
 }
 
+Future<Response> _publicStockSummaryHandler(Request request) async {
+  final connection = await openConnection();
+  try {
+    final result = await connection.query(
+      'SELECT p.sku, COALESCE(SUM(bc.quantity), 0) AS total_quantity '
+      'FROM products p '
+      'LEFT JOIN batches b ON b.product_id = p.id '
+      "LEFT JOIN batch_containers bc ON bc.batch_id = b.id AND bc.status = 'active' "
+      'GROUP BY p.sku '
+      'ORDER BY p.sku',
+    );
+
+    final items = result
+        .map((row) => {
+              'sku': row[0] as String,
+              'quantity': _toNumOrNull(row[1]) ?? 0,
+            })
+        .toList();
+
+    return _jsonResponse(200, jsonEncode(items));
+  } finally {
+    await connection.close();
+  }
+}
+
 Future<Response> _listProductsHandler(Request request) async {
   final userId = request.context['userId'] as int;
 
@@ -708,7 +938,8 @@ Future<Response> _listProductsHandler(Request request) async {
     final result = await connection.query(
       'SELECT p.id, p.organization_id, p.category_id, p.sku, p.barcode, '
       'p.name, p.unit, p.min_stock, p.max_stock, p.default_shelf_life_days, '
-      'p.attributes, p.created_at, c.name '
+      'p.attributes, p.created_at, c.name, p.default_container_type, '
+      'p.default_unit_weight_kg '
       'FROM products p '
       'JOIN product_categories c ON c.id = p.category_id '
       'WHERE ${conditions.join(' AND ')} '
@@ -717,7 +948,12 @@ Future<Response> _listProductsHandler(Request request) async {
     );
 
     final products = result
-        .map((row) => _rowToProduct(row, row[12] as String))
+        .map((row) => _rowToProduct(
+            row,
+            row[12] as String,
+            defaultContainerType: row[13] as String?,
+            defaultUnitWeightKg: _toNumOrNull(row[14]),
+          ))
         .toList();
     return _jsonResponse(200, jsonEncode(products));
   } finally {
@@ -757,6 +993,14 @@ Future<Response> _createProductHandler(Request request) async {
   final maxStock = body['max_stock'];
   final defaultShelfLifeDays = body['default_shelf_life_days'];
   final attributes = body['attributes'];
+  final defaultContainerType = body['default_container_type'];
+  final defaultUnitWeightKg = body['default_unit_weight_kg'];
+  if (defaultContainerType != null && defaultContainerType is! String) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+  if (defaultUnitWeightKg != null && defaultUnitWeightKg is! num) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
   if (minStock != null && minStock is! num) {
     return _jsonResponse(400, '{"error":"invalid_request"}');
   }
@@ -807,11 +1051,14 @@ Future<Response> _createProductHandler(Request request) async {
     final result = await connection.query(
       'INSERT INTO products '
       '(organization_id, category_id, sku, barcode, name, unit, min_stock, '
-      'max_stock, default_shelf_life_days, attributes) '
+      'max_stock, default_shelf_life_days, attributes, default_container_type, '
+      'default_unit_weight_kg) '
       'VALUES (@orgId, @categoryId, @sku, @barcode, @name, @unit, @minStock, '
-      '@maxStock, @defaultShelfLifeDays, @attributes::jsonb) '
+      '@maxStock, @defaultShelfLifeDays, @attributes::jsonb, '
+      '@defaultContainerType, @defaultUnitWeightKg) '
       'RETURNING id, organization_id, category_id, sku, barcode, name, unit, '
-      'min_stock, max_stock, default_shelf_life_days, attributes, created_at',
+      'min_stock, max_stock, default_shelf_life_days, attributes, created_at, '
+      'default_container_type, default_unit_weight_kg',
       substitutionValues: {
         'orgId': organizationId,
         'categoryId': categoryId,
@@ -823,6 +1070,8 @@ Future<Response> _createProductHandler(Request request) async {
         'maxStock': maxStock,
         'defaultShelfLifeDays': defaultShelfLifeDays,
         'attributes': jsonEncode(attributes),
+        'defaultContainerType': defaultContainerType,
+        'defaultUnitWeightKg': defaultUnitWeightKg,
       },
     );
 
@@ -833,8 +1082,16 @@ Future<Response> _createProductHandler(Request request) async {
         .first
         .first as String;
 
+    final createdRow = result.first;
     return _jsonResponse(
-        201, jsonEncode(_rowToProduct(result.first, categoryName)));
+      201,
+      jsonEncode(_rowToProduct(
+          createdRow,
+          categoryName,
+          defaultContainerType: createdRow[12] as String?,
+          defaultUnitWeightKg: _toNumOrNull(createdRow[13]),
+        )),
+    );
   } finally {
     await connection.close();
   }
@@ -854,7 +1111,8 @@ Future<Response> _getProductHandler(Request request) async {
     final result = await connection.query(
       'SELECT p.id, p.organization_id, p.category_id, p.sku, p.barcode, '
       'p.name, p.unit, p.min_stock, p.max_stock, p.default_shelf_life_days, '
-      'p.attributes, p.created_at, c.name '
+      'p.attributes, p.created_at, c.name, p.default_container_type, '
+      'p.default_unit_weight_kg '
       'FROM products p '
       'JOIN product_categories c ON c.id = p.category_id '
       'WHERE p.id = @id AND p.organization_id = @orgId',
@@ -866,7 +1124,14 @@ Future<Response> _getProductHandler(Request request) async {
 
     final row = result.first;
     return _jsonResponse(
-        200, jsonEncode(_rowToProduct(row, row[12] as String)));
+      200,
+      jsonEncode(_rowToProduct(
+          row,
+          row[12] as String,
+          defaultContainerType: row[13] as String?,
+          defaultUnitWeightKg: _toNumOrNull(row[14]),
+        )),
+    );
   } finally {
     await connection.close();
   }
@@ -886,7 +1151,8 @@ Future<Response> _getProductByBarcodeHandler(Request request) async {
     final result = await connection.query(
       'SELECT p.id, p.organization_id, p.category_id, p.sku, p.barcode, '
       'p.name, p.unit, p.min_stock, p.max_stock, p.default_shelf_life_days, '
-      'p.attributes, p.created_at, c.name '
+      'p.attributes, p.created_at, c.name, p.default_container_type, '
+      'p.default_unit_weight_kg '
       'FROM products p '
       'JOIN product_categories c ON c.id = p.category_id '
       'WHERE p.barcode = @barcode AND p.organization_id = @orgId',
@@ -898,7 +1164,14 @@ Future<Response> _getProductByBarcodeHandler(Request request) async {
 
     final row = result.first;
     return _jsonResponse(
-        200, jsonEncode(_rowToProduct(row, row[12] as String)));
+      200,
+      jsonEncode(_rowToProduct(
+          row,
+          row[12] as String,
+          defaultContainerType: row[13] as String?,
+          defaultUnitWeightKg: _toNumOrNull(row[14]),
+        )),
+    );
   } finally {
     await connection.close();
   }
@@ -943,6 +1216,10 @@ Future<Response> _updateProductHandler(Request request) async {
     final hasMinStock = body.containsKey('min_stock');
     final hasMaxStock = body.containsKey('max_stock');
     final attributes = body['attributes'];
+    final defaultContainerType = body['default_container_type'];
+    final defaultUnitWeightKg = body['default_unit_weight_kg'];
+    final hasDefaultContainerType = body.containsKey('default_container_type');
+    final hasDefaultUnitWeightKg = body.containsKey('default_unit_weight_kg');
 
     if (name != null && name is! String) {
       return _jsonResponse(400, '{"error":"invalid_request"}');
@@ -954,6 +1231,21 @@ Future<Response> _updateProductHandler(Request request) async {
       return _jsonResponse(400, '{"error":"invalid_request"}');
     }
     if (hasMaxStock && maxStock is! num && maxStock != null) {
+      return _jsonResponse(400, '{"error":"invalid_request"}');
+    }
+    if (hasDefaultContainerType &&
+        defaultContainerType != null &&
+        defaultContainerType is! String) {
+      return _jsonResponse(400, '{"error":"invalid_request"}');
+    }
+    if (hasDefaultUnitWeightKg &&
+        defaultUnitWeightKg != null &&
+        defaultUnitWeightKg is! num) {
+      return _jsonResponse(400, '{"error":"invalid_request"}');
+    }
+    if (hasDefaultUnitWeightKg &&
+        defaultUnitWeightKg != null &&
+        defaultUnitWeightKg <= 0) {
       return _jsonResponse(400, '{"error":"invalid_request"}');
     }
 
@@ -998,6 +1290,14 @@ Future<Response> _updateProductHandler(Request request) async {
       sets.add('attributes = @attributes::jsonb');
       values['attributes'] = jsonEncode(attributes);
     }
+    if (hasDefaultContainerType) {
+      sets.add('default_container_type = @defaultContainerType');
+      values['defaultContainerType'] = defaultContainerType;
+    }
+    if (hasDefaultUnitWeightKg) {
+      sets.add('default_unit_weight_kg = @defaultUnitWeightKg');
+      values['defaultUnitWeightKg'] = defaultUnitWeightKg;
+    }
     if (sets.isEmpty) {
       return _jsonResponse(400, '{"error":"invalid_request"}');
     }
@@ -1011,7 +1311,8 @@ Future<Response> _updateProductHandler(Request request) async {
     final result = await connection.query(
       'SELECT p.id, p.organization_id, p.category_id, p.sku, p.barcode, '
       'p.name, p.unit, p.min_stock, p.max_stock, p.default_shelf_life_days, '
-      'p.attributes, p.created_at, c.name '
+      'p.attributes, p.created_at, c.name, p.default_container_type, '
+      'p.default_unit_weight_kg '
       'FROM products p '
       'JOIN product_categories c ON c.id = p.category_id '
       'WHERE p.id = @id AND p.organization_id = @orgId',
@@ -1020,7 +1321,14 @@ Future<Response> _updateProductHandler(Request request) async {
 
     final row = result.first;
     return _jsonResponse(
-        200, jsonEncode(_rowToProduct(row, row[12] as String)));
+      200,
+      jsonEncode(_rowToProduct(
+          row,
+          row[12] as String,
+          defaultContainerType: row[13] as String?,
+          defaultUnitWeightKg: _toNumOrNull(row[14]),
+        )),
+    );
   } finally {
     await connection.close();
   }
@@ -1375,6 +1683,7 @@ Map<String, dynamic> _rowToBatchContainer(List row) {
     'status': row[5],
     'created_at': (row[6] as DateTime).toUtc().toIso8601String(),
     'location_code': row[7],
+    'unit_weight_kg': row.length > 8 ? _toNumOrNull(row[8]) : null,
   };
 }
 
@@ -1512,14 +1821,18 @@ Future<Response> _createBatchContainerHandler(Request request) async {
     return _jsonResponse(400, '{"error":"invalid_request"}');
   }
 
-  final containerBarcode = body['container_barcode'] as String?;
-  final quantity = body['quantity'] as num?;
+  var containerBarcode = (body['container_barcode'] as String?)?.trim();
+  final unitCount = body['unit_count'] as num?;
+  final unitWeightKg = body['unit_weight_kg'] as num?;
   final locationId = body['location_id'] as int?;
-  if (containerBarcode == null ||
-      containerBarcode.isEmpty ||
-      quantity == null) {
+  if (unitCount == null ||
+      unitCount <= 0 ||
+      unitWeightKg == null ||
+      unitWeightKg <= 0) {
     return _jsonResponse(400, '{"error":"invalid_request"}');
   }
+
+  final quantity = unitCount * unitWeightKg;
 
   final connection = await openConnection();
   try {
@@ -1541,6 +1854,33 @@ Future<Response> _createBatchContainerHandler(Request request) async {
       }
     }
 
+    if (containerBarcode == null || containerBarcode.isEmpty) {
+      final skuResult = await connection.query(
+        'SELECT p.sku FROM batches b JOIN products p ON p.id = b.product_id '
+        'WHERE b.id = @batchId',
+        substitutionValues: {'batchId': batchId},
+      );
+      final sku = skuResult.first.first as String;
+      final now = DateTime.now();
+      final datePart = '${(now.year % 100).toString().padLeft(2, '0')}'
+          '${now.month.toString().padLeft(2, '0')}'
+          '${now.day.toString().padLeft(2, '0')}';
+      final prefix = '$sku-$datePart-';
+      var seq = 1;
+      while (true) {
+        final candidate = '$prefix${seq.toString().padLeft(2, '0')}';
+        final taken = await connection.query(
+          'SELECT 1 FROM batch_containers WHERE container_barcode = @barcode',
+          substitutionValues: {'barcode': candidate},
+        );
+        if (taken.isEmpty) {
+          containerBarcode = candidate;
+          break;
+        }
+        seq++;
+      }
+    }
+
     final existing = await connection.query(
       'SELECT 1 FROM batch_containers WHERE container_barcode = @barcode',
       substitutionValues: {'barcode': containerBarcode},
@@ -1551,13 +1891,14 @@ Future<Response> _createBatchContainerHandler(Request request) async {
 
     await connection.execute(
       'INSERT INTO batch_containers '
-      '(batch_id, container_barcode, quantity, location_id) '
-      'VALUES (@batchId, @barcode, @quantity, @locationId)',
+      '(batch_id, container_barcode, quantity, location_id, unit_weight_kg) '
+      'VALUES (@batchId, @barcode, @quantity, @locationId, @unitWeightKg)',
       substitutionValues: {
         'batchId': batchId,
         'barcode': containerBarcode,
         'quantity': quantity,
         'locationId': locationId,
+        'unitWeightKg': unitWeightKg,
       },
     );
 
@@ -1571,7 +1912,7 @@ Future<Response> _createBatchContainerHandler(Request request) async {
 
     final result = await connection.query(
       'SELECT bc.id, bc.batch_id, bc.container_barcode, bc.quantity, '
-      'bc.location_id, bc.status, bc.created_at, sl.code '
+      'bc.location_id, bc.status, bc.created_at, sl.code, bc.unit_weight_kg '
       'FROM batch_containers bc '
       'LEFT JOIN storage_locations sl ON sl.id = bc.location_id '
       'WHERE bc.batch_id = @batchId AND bc.container_barcode = @barcode',
@@ -1601,7 +1942,7 @@ Future<Response> _listBatchContainersHandler(Request request) async {
 
     final result = await connection.query(
       'SELECT bc.id, bc.batch_id, bc.container_barcode, bc.quantity, '
-      'bc.location_id, bc.status, bc.created_at, sl.code '
+      'bc.location_id, bc.status, bc.created_at, sl.code, bc.unit_weight_kg '
       'FROM batch_containers bc '
       'LEFT JOIN storage_locations sl ON sl.id = bc.location_id '
       'WHERE bc.batch_id = @batchId ORDER BY bc.id',
@@ -1821,7 +2162,7 @@ Future<Response> _getContainerByBarcodeHandler(Request request) async {
 
     final result = await connection.query(
       'SELECT bc.id, bc.batch_id, bc.container_barcode, bc.quantity, '
-      'bc.location_id, bc.status, bc.created_at, sl.code, '
+      'bc.location_id, bc.status, bc.created_at, sl.code, bc.unit_weight_kg, '
       'p.name, p.sku, p.barcode, b.lot_number, b.expiry_date, b.quality_status, '
       'w.name '
       'FROM batch_containers bc '
@@ -1839,13 +2180,13 @@ Future<Response> _getContainerByBarcodeHandler(Request request) async {
 
     final row = result.first;
     final container = _rowToBatchContainer(row);
-    container['product_name'] = row[8];
-    container['product_sku'] = row[9];
-    container['product_barcode'] = row[10];
-    container['lot_number'] = row[11];
-    container['expiry_date'] = _dateToString(row[12]);
-    container['quality_status'] = row[13];
-    container['warehouse_name'] = row[14];
+    container['product_name'] = row[9];
+    container['product_sku'] = row[10];
+    container['product_barcode'] = row[11];
+    container['lot_number'] = row[12];
+    container['expiry_date'] = _dateToString(row[13]);
+    container['quality_status'] = row[14];
+    container['warehouse_name'] = row[15];
     return _jsonResponse(200, jsonEncode(container));
   } finally {
     await connection.close();

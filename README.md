@@ -1,7 +1,13 @@
 # WMS Backend
 
 Eclair zavodi uchun ombor boshqaruv tizimi (WMS) backend servisi.
-Dart + Shelf freymvork, Neon.tech PostgreSQL bazasi.
+Dart + Shelf freymvork, lokal PostgreSQL bazasi (Docker orqali).
+
+Barcha ma'lumot shu kompyuterda saqlanadi — bulut xizmatlariga bog'liq
+emas.
+
+> **To'liq qo'llanma:** [QULLANMA.md](QULLANMA.md) — o'rnatish,
+> foydalanish, rollar, Excel import, API ro'yxati va muammolarni hal qilish.
 
 ## Ishga tushirish
 
@@ -11,23 +17,37 @@ Dart + Shelf freymvork, Neon.tech PostgreSQL bazasi.
 dart pub get
 ```
 
-2. `.env` faylini yarating (namuna uchun `.env.example`ga qarang):
+2. Postgres'ni ishga tushiring:
+
+```
+docker compose up -d
+```
+
+3. `.env` faylini yarating (namuna uchun `.env.example`ga qarang):
 
 ```
 cp .env.example .env
 ```
 
-Keyin `.env` ichidagi `DATABASE_URL`ga Neon.tech'dagi haqiqiy
-PostgreSQL connection stringni qo'ying (masalan:
-`postgresql://user:password@host/dbname?sslmode=require`).
+Lokal Postgres uchun quyidagi qiymat to'g'ri keladi:
 
-3. Serverni ishga tushiring:
+```
+DATABASE_URL=postgresql://wms:wms_local_dev@localhost:5432/wms
+```
+
+4. Migratsiyalarni ishga tushiring:
+
+```
+dart run bin/migrate.dart
+```
+
+5. Serverni ishga tushiring:
 
 ```
 dart run bin/server.dart
 ```
 
-4. Boshqa terminal oynasida /health endpointni tekshiring:
+6. Boshqa terminal oynasida /health endpointni tekshiring:
 
 ```
 curl -s localhost:8080/health
@@ -94,64 +114,37 @@ curl -s -X POST localhost:8080/warehouses/1/users \
 curl -s localhost:8080/warehouses/1/users -H "Authorization: Bearer <TOKEN>"
 ```
 
-## Render.com'da deploy (A5)
+## Lokal Postgres (Docker orqali)
 
-Repository: `wms_backend/` (git repo `warehouse`). `render.yaml` va `Dockerfile`
-repo tub papkasida tayyor.
+Bazaning barcha ma'lumoti shu noutbukda saqlanadi. `docker-compose.yml`
+Postgres 18 konteynerini 5432-portda ko'taradi va ma'lumotni `wms_pgdata`
+volume'ida saqlaydi — konteyner o'chirilsa ham yo'qolmaydi.
 
-### Qadamlari (Dashboard orqali)
-
-1. Render.com'da "New +" -> "Blueprint" yoki "Web Service".
-2. GitHub reposini ulang (`Farxodxon/warehouse`).
-3. Agar **Web Service** tanlansa:
-   - Runtime: **Docker**
-   - Root directory: `wms_backend` (agar repo ichida boshqa papka bo'lsa)
-   - Health check path: `/health`
-   - Plan: Free
-4. Environment variables kiritish (Render Dashboard "Environment" bo'limida):
-   - `DATABASE_URL` - Neon.tech PostgreSQL ulanish qatori (masalan
-     `postgresql://user:password@host/dbname?sslmode=require`)
-   - `JWT_SECRET` - uzun tasodifiy qator (token imzolash uchun)
-   - `PORT` - `8080` (agar Render berilmasa, default 8080)
-
-   E'tibor: `render.yaml`da `DATABASE_URL` va `JWT_SECRET` uchun faqat `sync: false`
-   ko'rsatilgan - haqiqiy qiymatlar **Render Dashboard'da qo'lda** kiritiladi,
-   repo'da saqlanmaydi.
-
-5. `Deploy` tugmasini bosing. Render GitHub'ga push qilingan har bir yangi
-   commitni avtomatik deploy qiladi.
-
-### `render.yaml` (avtomatik Blueprint uchun)
-
-```yaml
-services:
-  - type: web
-    name: eclair-wms-backend
-    runtime: docker
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
-    plan: free
-    healthCheckPath: /health
-    envVars:
-      - key: DATABASE_URL
-        sync: false
-      - key: JWT_SECRET
-        sync: false
-      - key: PORT
-        value: 8080
+```
+docker compose up -d      # Postgres'ni ishga tushirish
+docker compose ps         # holatni ko'rish
+docker compose stop       # to'xtatish (ma'lumot saqlanadi)
+docker compose down       # o'chirish (volume saqlanadi)
 ```
 
-### Mahalliy Docker sinovi
+Konektsiya qatori `.env` da:
 
-```sh
-docker build -t wms-backend-test .
-docker run -p 8080:8080 \
-  -e DATABASE_URL="$DATABASE_URL" \
-  -e JWT_SECRET="$JWT_SECRET" \
-  wms-backend-test
-curl -s localhost:8080/health
-# {"status":"ok","database":"connected"}
+```
+DATABASE_URL=postgresql://wms:wms_local_dev@localhost:5432/wms
 ```
 
-`.env` fayli Docker image ichiga kirmaydi (`.dockerignore`da chiqarib tashlangan) -
-muhit o'zgaruvchilari faqat `-e` yoki Render orqali beriladi.
+## Testlar
+
+`test/smoke_test.dart` **ishlab turgan server va haqiqiy bazani** talab qiladi,
+shuning uchun avval serverni ishga tushiring:
+
+```
+Terminal 1: dart run bin/server.dart
+Terminal 2: dart test test/smoke_test.dart
+```
+
+Login hisob ma'lumotlarini muhit orqali berish mumkin
+(`WMS_TEST_EMAIL` / `WMS_TEST_PASSWORD`).
+
+Eski `test/server_test.dart` — `shelf` scaffold qoldig'i bo'lib, WMS
+endpointlarini tekshirmaydi va `dart test` ni har doim qizil qoldiradi.
