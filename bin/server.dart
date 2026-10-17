@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -19,6 +20,9 @@ import 'package:wms_backend/products/batch_validation.dart';
 import 'package:wms_backend/products/location_code.dart';
 import 'package:wms_backend/reports/stock_report.dart';
 import 'package:wms_backend/reports/transactions_report.dart';
+import 'package:wms_backend/telegram/stock_format.dart';
+import 'package:wms_backend/telegram/telegram_client.dart';
+import 'package:wms_backend/telegram/webhook.dart';
 
 final _router = Router()
   ..get('/health', _healthHandler)
@@ -90,7 +94,9 @@ final _router = Router()
   ..get('/reports/stock.xlsx',
       authMiddleware()(_stockReportHandler))
   ..get('/reports/transactions.xlsx',
-      authMiddleware()(_transactionsReportHandler));
+      authMiddleware()(_transactionsReportHandler))
+  // QASDAN LOGINSIZ - Telegram webhook, secret header bilan himoyalangan
+  ..post('/telegram/webhook', _telegramWebhookHandler);
 
 Response _jsonResponse(int statusCode, String body) {
   return Response(statusCode,
@@ -2301,6 +2307,183 @@ Map<String, dynamic> _containerStateResponse(List container) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// T-Telegram: webhook, /qoldiq buyrug'i va chiqim xabarlari
+// ---------------------------------------------------------------------------
+
+TelegramSettings? _telegramSettings;
+TelegramSender? _telegramSender;
+
+/// POST /telegram/webhook - QASDAN LOGINSIZ (Telegram JWT yubormaydi).
+/// Faqat `X-Telegram-Bot-Api-Secret-Token` sarlavhasi doimiy vaqtli
+/// taqqoslanadi; o'chiq bo'lsa (token/secret bo'sh) 404.
+Future<Response> _telegramWebhookHandler(Request request) async {
+  final settings = _telegramSettings;
+  final sender = _telegramSender;
+  if (settings == null || sender == null) {
+    return _jsonResponse(404, '{"error":"not_found"}');
+  }
+  return handleTelegramWebhook(
+    request,
+    settings: settings,
+    sender: sender,
+    lookup: _lookupStockForTelegram,
+    log: (line) => stdout.writeln(line),
+  );
+}
+
+/// /qoldiq uchun qoldiqni bazadan FAQAT SELECT bilan o'qiydi.
+Future<List<StockMatch>> _lookupStockForTelegram(String query) async {
+  final connection = await openConnection();
+  try {
+    return await lookupStock(connection, query);
+  } finally {
+    await connection.close();
+  }
+}
+
+/// Muvaffaqiyatli chiqimdan keyin guruhlarga xabar (FON REJIMDA).
+///
+/// OUT/FEFO javobini hech qachon kechiktirmaydi va buzmaydi: o'z
+/// connection'ini ochadi, xatolari ichida ushlanadi, javob kutmaydi.
+/// Xatolikda faqat logga yoziladi (token'siz).
+void _notifyOut({
+  required int userId,
+  int? containerId,
+  num? quantity,
+  int? productId,
+  List<Map<String, dynamic>>? fefoItems,
+}) {
+  final settings = _telegramSettings;
+  final sender = _telegramSender;
+  if (settings == null ||
+      sender == null ||
+      !settings.enabled ||
+      settings.chatIds.isEmpty) {
+    return;
+  }
+  unawaited(() async {
+    try {
+      final connection = await openConnection();
+      try {
+        late String sku;
+        late String name;
+        late String unit;
+        late int outProductId;
+        final items = <OutItem>[];
+
+        if (containerId != null) {
+          final rows = await connection.query(
+            'SELECT p.id, p.sku, p.name, p.unit, b.lot_number, '
+            'bc.container_barcode '
+            'FROM batch_containers bc '
+            'JOIN batches b ON b.id = bc.batch_id '
+            'JOIN products p ON p.id = b.product_id '
+            'WHERE bc.id = @containerId',
+            substitutionValues: {'containerId': containerId},
+          );
+          if (rows.isEmpty) return;
+          final row = rows.first;
+          outProductId = row[0] as int;
+          sku = row[1] as String;
+          name = row[2] as String;
+          unit = row[3] as String;
+          items.add(OutItem(
+            lotNumber: row[4] as String,
+            containerBarcode: row[5] as String,
+            quantity: quantity ?? 0,
+          ));
+        } else {
+          outProductId = productId!;
+          final rows = await connection.query(
+            'SELECT sku, name, unit FROM products WHERE id = @productId',
+            substitutionValues: {'productId': productId},
+          );
+          if (rows.isEmpty) return;
+          sku = rows.first[0] as String;
+          name = rows.first[1] as String;
+          unit = rows.first[2] as String;
+          for (final item in fefoItems ?? const <Map<String, dynamic>>[]) {
+            items.add(OutItem(
+              containerBarcode: (item['container_barcode'] ?? '').toString(),
+              lotNumber: (item['lot_number'] ?? '').toString(),
+              quantity: (item['take_quantity'] as num?) ?? 0,
+            ));
+          }
+        }
+
+        // Qoldiq chiqimdan KEYINGI holat (bazadan o'qiladi).
+        final remaining = await fetchProductGroups(connection, outProductId);
+
+        var performer = '-';
+        final userRows = await connection.query(
+          'SELECT full_name FROM users WHERE id = @userId',
+          substitutionValues: {'userId': userId},
+        );
+        if (userRows.isNotEmpty) {
+          final fullName = userRows.first[0]?.toString().trim() ?? '';
+          if (fullName.isNotEmpty) performer = fullName;
+        }
+
+        final message = buildOutMessage(
+          sku: sku,
+          productName: name,
+          unit: unit,
+          items: items,
+          remainingGroups: remaining,
+          performer: performer,
+          time: DateTime.now(),
+        );
+        for (final chatId in settings.chatIds) {
+          await sender.sendMessage(chatId, message);
+        }
+      } finally {
+        await connection.close();
+      }
+    } catch (e) {
+      stdout.writeln(
+          'Telegram chiqim xabari yuborilmadi: ${settings.sanitize(e.toString())}');
+    }
+  }());
+}
+
+/// Server ishga tushganda webhook'ni avtomatik ro'yxatdan o'tkazadi.
+/// Fon rejimida (kutmaydi); xato bo'lsa faqat logga yoziladi, token'siz.
+void _registerTelegramWebhook(TelegramSettings settings) {
+  final baseUrl = settings.publicBaseUrl;
+  if (baseUrl == null) {
+    stdout.writeln('Telegram setWebhook otkazib yuborildi: public URL '
+        "yo'q (RENDER_EXTERNAL_URL yoki PUBLIC_BASE_URL)");
+    return;
+  }
+  unawaited(() async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
+    try {
+      final uri =
+          Uri.parse('https://api.telegram.org/bot${settings.token}/setWebhook');
+      final request =
+          await client.postUrl(uri).timeout(const Duration(seconds: 5));
+      request.headers.contentType = ContentType.json;
+      request.write(jsonEncode({
+        'url': '$baseUrl/telegram/webhook',
+        'secret_token': settings.secret,
+      }));
+      final response = await request.close().timeout(const Duration(seconds: 5));
+      await response.drain<void>();
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        stdout.writeln('Telegram setWebhook xato: HTTP ${response.statusCode}');
+      } else {
+        stdout.writeln('Telegram setWebhook ok');
+      }
+    } catch (e) {
+      stdout.writeln(
+          'Telegram setWebhook xatosi: ${settings.sanitize(e.toString())}');
+    } finally {
+      client.close(force: true);
+    }
+  }());
+}
+
 Future<Response> _inventoryOutHandler(Request request) async {
   final userId = request.context['userId'] as int;
   if (!await _canOperateInventory(userId)) {
@@ -2402,6 +2585,8 @@ Future<Response> _inventoryOutHandler(Request request) async {
     final state = _containerStateResponse(result.first);
     state['remaining_quantity'] = state['quantity'];
     state['quantity'] = quantity;
+    // Telegram xabari fon rejimda (kutmaydi) - javobni buzmaydi.
+    _notifyOut(userId: userId, containerId: containerId, quantity: quantity);
     return _jsonResponse(201, jsonEncode(state));
   } finally {
     await connection.close();
@@ -2776,6 +2961,8 @@ Future<Response> _fefoOutHandler(Request request) async {
       );
     }
 
+    // Telegram xabari fon rejimda (kutmaydi) - javobni buzmaydi.
+    _notifyOut(userId: userId, productId: productId, fefoItems: executed);
     return _jsonResponseBody(201, {
       'requested': quantity,
       'covered': quantity,
@@ -2931,9 +3118,20 @@ bool _isIsoDate(String? value) {
 void main(List<String> args) async {
   final ip = InternetAddress.anyIPv4;
 
+  // T-Telegram: env bo'sh bo'lsa (token/secret yo'q) butun funksiya o'chiq:
+  // server ishlaydi, /telegram/webhook 404 qaytaradi.
+  _telegramSettings = TelegramSettings.fromEnvironment();
+  if (_telegramSettings!.enabled) {
+    _telegramSender = HttpTelegramSender(token: _telegramSettings!.token);
+  }
+
   final handler = Pipeline().addMiddleware(logRequests()).addHandler(_router);
 
   final port = int.parse(Platform.environment['PORT'] ?? '8080');
   final server = await serve(handler, ip, port);
-  print('Server running on http://localhost:${server.port}');
+  print('Server running on port ${server.port}');
+
+  if (_telegramSettings!.enabled) {
+    _registerTelegramWebhook(_telegramSettings!);
+  }
 }

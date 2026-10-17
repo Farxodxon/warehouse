@@ -148,3 +148,50 @@ Login hisob ma'lumotlarini muhit orqali berish mumkin
 
 Eski `test/server_test.dart` — `shelf` scaffold qoldig'i bo'lib, WMS
 endpointlarini tekshirmaydi va `dart test` ni har doim qizil qoldiradi.
+
+
+## Telegram bot sozlash
+
+Chiqim (OUT/FEFO) xabarlari va `/qoldiq` buyrug'i uchun bot **webhook**
+rejimida ishlaydi (Render bepul tarifda uxlab qolgani uchun polling emas).
+Bot faqat o'qiydi: chiqim/kirim/tuzatish buyruqlari yo'q.
+
+Sozlash qadamlari:
+
+1. [@BotFather](https://t.me/BotFather) dan yangi bot yarating va
+   **token**ni oling (`TELEGRAM_BOT_TOKEN` uchun).
+2. Botni xabar yuborilmoqchi bo'lgan guruhga qo'shing.
+3. Render'da servis sozlamalariga 3 ta muhit o'zgaruvchisini qo'shing
+   (qiymatni kiriting, `sync: false`):
+
+   | O'zgaruvchi | Qiymat |
+   |---|---|
+   | `TELEGRAM_BOT_TOKEN` | BotFather bergan token |
+   | `TELEGRAM_WEBHOOK_SECRET` | Tasodifiy uzun matn (masalan: `openssl rand -hex 32`) |
+   | `TELEGRAM_CHAT_IDS` | Ruxsatli chat ID'lari, vergul bilan |
+
+4. Deploy'dan keyin guruhga `/id` yozing - bot `Bu chat ID: <raqam>`
+   javobini qaytaradi. Bu raqamni `TELEGRAM_CHAT_IDS`ga qo'shing va
+   servisni qayta deploy qiling.
+
+Webhook avtomatik ro'yxatdan o'tkaziladi: server ishga tushganda
+`RENDER_EXTERNAL_URL` (yoki `PUBLIC_BASE_URL`) asosida
+`<ommaviy manzil>/telegram/webhook` manziliga ulanadi.
+
+Tekshirish (guruhda):
+
+```
+/yordam          buyruqlar ro'yxati
+/id              chat ID raqami
+/qoldiq L001/2   mahsulot qoldig'i (SKU yoki nom bo'yicha)
+```
+
+Eslatma: token va secret qiymatlari README'ga, loglarga va commit'ga
+yozilmaydi. Env bo'sh bo'lsa webhook o'chiq turadi (`404`), server
+ishlashda davom etadi.
+
+Birlik testlari (tarmoq va bazasiz):
+
+```
+dart test test/telegram_test.dart
+```
