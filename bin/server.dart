@@ -13,6 +13,7 @@ import 'package:wms_backend/auth/password.dart';
 import 'package:wms_backend/db/connection.dart';
 import 'package:wms_backend/inventory/expiry_alerts.dart';
 import 'package:wms_backend/inventory/fefo_planner.dart';
+import 'package:wms_backend/inventory/opening_stock.dart';
 import 'package:wms_backend/inventory/quality_workflow.dart';
 import 'package:wms_backend/products/attribute_schema.dart';
 import 'package:wms_backend/products/attribute_values.dart';
@@ -91,6 +92,8 @@ final _router = Router()
       authMiddleware()(_inventoryAdjustmentHandler))
   ..get('/inventory/transactions',
       authMiddleware()(_listInventoryTransactionsHandler))
+  ..post('/inventory/opening-stock',
+      authMiddleware()(_openingStockImportHandler))
   ..get('/reports/stock.xlsx',
       authMiddleware()(_stockReportHandler))
   ..get('/reports/transactions.xlsx',
@@ -1868,10 +1871,8 @@ Future<Response> _createBatchContainerHandler(Request request) async {
       );
       final sku = skuResult.first.first as String;
       final now = DateTime.now();
-      final datePart = '${(now.year % 100).toString().padLeft(2, '0')}'
-          '${now.month.toString().padLeft(2, '0')}'
-          '${now.day.toString().padLeft(2, '0')}';
-      final prefix = '$sku-$datePart-';
+      final datePart = datePartYYMMDD(now);
+      final prefix = '${barcodeSkuPart(sku)}-$datePart-';
       var seq = 1;
       while (true) {
         final candidate = '$prefix${seq.toString().padLeft(2, '0')}';
@@ -2758,6 +2759,577 @@ Future<Response> _inventoryAdjustmentHandler(Request request) async {
     final state = _containerStateResponse(result.first);
     state['delta'] = delta;
     return _jsonResponse(201, jsonEncode(state));
+  } finally {
+    await connection.close();
+  }
+}
+
+class _OpeningProductRef {
+  int? id;
+  final String normalizedSku;
+  final String sku;
+  final String name;
+  final num? defaultUnitWeightKg;
+  final String? defaultContainerType;
+  final int? categoryId;
+  final num? shelfLifeMonths;
+
+  _OpeningProductRef({
+    this.id,
+    required this.normalizedSku,
+    required this.sku,
+    required this.name,
+    this.defaultUnitWeightKg,
+    this.defaultContainerType,
+    this.categoryId,
+    this.shelfLifeMonths,
+  });
+}
+
+class _OpeningContainerPlan {
+  final int row;
+  final _OpeningProductRef product;
+  final num unitCount;
+  final num unitWeightKg;
+  final String lotNumber;
+  final String? expiryDate;
+  final int? locationId;
+  final String? locationCode;
+
+  _OpeningContainerPlan({
+    required this.row,
+    required this.product,
+    required this.unitCount,
+    required this.unitWeightKg,
+    required this.lotNumber,
+    this.expiryDate,
+    this.locationId,
+    this.locationCode,
+  });
+
+  num get quantity => unitCount * unitWeightKg;
+}
+
+Future<Response> _openingStockImportHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  if (!await _canManageProducts(userId)) {
+    return _jsonResponse(403, '{"error":"forbidden"}');
+  }
+
+  final dynamic decoded;
+  try {
+    decoded = jsonDecode(await request.readAsString());
+  } catch (_) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+  if (decoded is! Map<String, dynamic>) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+  final body = decoded;
+  final rowsRaw = body['rows'];
+  if (rowsRaw is! List || rowsRaw.isEmpty) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  int? asInt(dynamic value) {
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    if (value is String) return int.tryParse(value.trim());
+    return null;
+  }
+
+  String? asString(dynamic value) {
+    if (value == null) return null;
+    final text = value.toString().trim();
+    return text.isEmpty ? null : text;
+  }
+
+  final defaultCategoryId = asInt(body['default_category_id']);
+  if (body['default_category_id'] != null && defaultCategoryId == null) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+  final warehouseId = asInt(body['warehouse_id']);
+  if (body['warehouse_id'] != null && warehouseId == null) {
+    return _jsonResponse(400, '{"error":"invalid_request"}');
+  }
+
+  final dryRunValue = request.url.queryParameters['dry_run'];
+  final dryRun = dryRunValue == 'true' ||
+      dryRunValue == '1' ||
+      dryRunValue == 'yes';
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final categoryResult = await connection.query(
+      'SELECT id, name FROM product_categories WHERE organization_id = @orgId',
+      substitutionValues: {'orgId': organizationId},
+    );
+    final categoryByName = <String, int>{};
+    final categoryIds = <int>{};
+    for (final row in categoryResult) {
+      final id = row[0] as int;
+      final name = ((row[1] as String?) ?? '').trim().toLowerCase();
+      categoryIds.add(id);
+      if (name.isNotEmpty) categoryByName[name] = id;
+    }
+    if (defaultCategoryId != null && !categoryIds.contains(defaultCategoryId)) {
+      return _jsonResponse(400, '{"error":"invalid_request"}');
+    }
+
+    var warehouseValid = true;
+    if (warehouseId != null) {
+      final warehouseResult = await connection.query(
+        'SELECT 1 FROM warehouses WHERE id = @warehouseId '
+        'AND organization_id = @orgId',
+        substitutionValues: {
+          'warehouseId': warehouseId,
+          'orgId': organizationId,
+        },
+      );
+      warehouseValid = warehouseResult.isNotEmpty;
+    }
+
+    final locationByCode = <String, int>{};
+    if (warehouseId != null && warehouseValid) {
+      final locationResult = await connection.query(
+        'SELECT id, code FROM storage_locations '
+        'WHERE warehouse_id = @warehouseId',
+        substitutionValues: {'warehouseId': warehouseId},
+      );
+      for (final row in locationResult) {
+        locationByCode[((row[1] as String?) ?? '').trim()] = row[0] as int;
+      }
+    }
+
+    final productResult = await connection.query(
+      'SELECT id, sku, name, default_unit_weight_kg, default_container_type '
+      'FROM products WHERE organization_id = @orgId',
+      substitutionValues: {'orgId': organizationId},
+    );
+    final existingByNorm = <String, _OpeningProductRef>{};
+    for (final row in productResult) {
+      final sku = ((row[1] as String?) ?? '').trim();
+      final normalized = normalizeSku(sku);
+      if (normalized.isEmpty) continue;
+      existingByNorm.putIfAbsent(
+        normalized,
+        () => _OpeningProductRef(
+          id: row[0] as int,
+          normalizedSku: normalized,
+          sku: sku,
+          name: (row[2] as String?) ?? '',
+          defaultUnitWeightKg: _toNumOrNull(row[3]),
+          defaultContainerType: row[4] as String?,
+        ),
+      );
+    }
+
+    final batchResult = await connection.query(
+      'SELECT id, product_id, lot_number FROM batches '
+      'WHERE organization_id = @orgId',
+      substitutionValues: {'orgId': organizationId},
+    );
+    final batchByKey = <String, int>{};
+    for (final row in batchResult) {
+      batchByKey['${row[1]}|${row[2]}'] = row[0] as int;
+    }
+
+    final plannedByNorm = <String, _OpeningProductRef>{};
+    final plans = <_OpeningContainerPlan>[];
+    final errors = <Map<String, dynamic>>[];
+    var productsOnly = 0;
+    var skippedNoQty = 0;
+    final todayLot = 'BQ-${datePartYYMMDD(DateTime.now())}';
+
+    int? resolveCategory(String? explicitName) {
+      if (explicitName != null && explicitName.isNotEmpty) {
+        final found = categoryByName[explicitName.toLowerCase()];
+        if (found != null) return found;
+      }
+      return defaultCategoryId;
+    }
+
+    _OpeningProductRef? findProduct(String normalized) {
+      return existingByNorm[normalized] ?? plannedByNorm[normalized];
+    }
+
+    _OpeningProductRef addPlannedProduct({
+      required String normalized,
+      required String sku,
+      required String name,
+      required int categoryId,
+      num? unitWeightKg,
+      String? containerType,
+      num? shelfLifeMonths,
+    }) {
+      final product = _OpeningProductRef(
+        normalizedSku: normalized,
+        sku: sku,
+        name: name,
+        defaultUnitWeightKg: unitWeightKg,
+        defaultContainerType: containerType,
+        categoryId: categoryId,
+        shelfLifeMonths: shelfLifeMonths,
+      );
+      plannedByNorm[normalized] = product;
+      return product;
+    }
+
+    for (var index = 0; index < rowsRaw.length; index++) {
+      final raw = rowsRaw[index];
+      if (raw is! Map) {
+        errors.add({
+          'row': index + 1,
+          'message': 'Qator formati noto\'g\'ri',
+        });
+        continue;
+      }
+      final rowNumber = asInt(raw['row']) ?? (index + 1);
+      final skuRaw = asString(raw['sku']);
+      if (skuRaw == null) {
+        errors.add({'row': rowNumber, 'message': 'SKU bo\'sh'});
+        continue;
+      }
+      final sku = fixHomoglyphs(skuRaw);
+      final normalized = normalizeSku(sku);
+      if (normalized.isEmpty) {
+        errors.add({'row': rowNumber, 'message': 'SKU bo\'sh'});
+        continue;
+      }
+
+      final unitCount = _toNumOrNull(raw['unit_count']);
+      if (unitCount == null) {
+        errors.add({'row': rowNumber, 'message': 'Idish soni noto\'g\'ri'});
+        continue;
+      }
+      if (unitCount < 0) {
+        errors.add({
+          'row': rowNumber,
+          'message': 'Idish soni manfiy bo\'lishi mumkin emas',
+        });
+        continue;
+      }
+
+      final rowName = asString(raw['name']);
+      final rowCategory = asString(raw['category']);
+      final rowContainerType = asString(raw['container_type']);
+      final rowWeight = _toNumOrNull(raw['unit_weight_kg']);
+      if (rowWeight != null && rowWeight <= 0) {
+        errors.add({
+          'row': rowNumber,
+          'message': '1 idish og\'irligi 0 dan katta bo\'lishi kerak',
+        });
+        continue;
+      }
+      final rowLot = asString(raw['lot_number']);
+      final rowExpiry = asString(raw['expiry_date']);
+      final rowLocation = asString(raw['location_code']);
+      final rowShelfLife = _toNumOrNull(raw['shelf_life_months']);
+
+      var product = findProduct(normalized);
+      if (unitCount == 0) {
+        if (product != null) {
+          skippedNoQty++;
+          continue;
+        }
+        if (rowName == null) {
+          skippedNoQty++;
+          continue;
+        }
+        final categoryId = resolveCategory(rowCategory);
+        if (categoryId == null) {
+          errors.add({
+            'row': rowNumber,
+            'message': rowCategory == null
+                ? 'Standart kategoriya tanlanmagan'
+                : 'Kategoriya topilmadi: $rowCategory',
+          });
+          continue;
+        }
+        addPlannedProduct(
+          normalized: normalized,
+          sku: sku,
+          name: rowName,
+          categoryId: categoryId,
+          unitWeightKg: rowWeight,
+          containerType: rowContainerType,
+          shelfLifeMonths: rowShelfLife,
+        );
+        productsOnly++;
+        continue;
+      }
+
+      if (product == null) {
+        if (rowName == null) {
+          errors.add({
+            'row': rowNumber,
+            'message': 'Mahsulot topilmadi va nomi ko\'rsatilmagan',
+          });
+          continue;
+        }
+        final categoryId = resolveCategory(rowCategory);
+        if (categoryId == null) {
+          errors.add({
+            'row': rowNumber,
+            'message': rowCategory == null
+                ? 'Standart kategoriya tanlanmagan'
+                : 'Kategoriya topilmadi: $rowCategory',
+          });
+          continue;
+        }
+        product = addPlannedProduct(
+          normalized: normalized,
+          sku: sku,
+          name: rowName,
+          categoryId: categoryId,
+          unitWeightKg: rowWeight,
+          containerType: rowContainerType,
+          shelfLifeMonths: rowShelfLife,
+        );
+      }
+
+      final weight = (rowWeight != null && rowWeight > 0)
+          ? rowWeight
+          : product.defaultUnitWeightKg;
+      if (weight == null || weight <= 0) {
+        errors.add({
+          'row': rowNumber,
+          'message': '1 idish og\'irligi ko\'rsatilmagan',
+        });
+        continue;
+      }
+
+      if (rowExpiry != null && !_isIsoDate(rowExpiry)) {
+        errors.add({
+          'row': rowNumber,
+          'message': 'Yaroqlilik muddati noto\'g\'ri (YYYY-MM-DD)',
+        });
+        continue;
+      }
+
+      int? locationId;
+      if (rowLocation != null) {
+        if (warehouseId == null) {
+          errors.add({
+            'row': rowNumber,
+            'message': 'Joylashuv kodi uchun ombor tanlanishi kerak',
+          });
+          continue;
+        }
+        if (!warehouseValid) {
+          errors.add({'row': rowNumber, 'message': 'Ombor topilmadi'});
+          continue;
+        }
+        locationId = locationByCode[rowLocation];
+        if (locationId == null) {
+          errors.add({
+            'row': rowNumber,
+            'message': 'Joylashuv kodi topilmadi: $rowLocation',
+          });
+          continue;
+        }
+      }
+
+      plans.add(_OpeningContainerPlan(
+        row: rowNumber,
+        product: product,
+        unitCount: unitCount,
+        unitWeightKg: weight,
+        lotNumber: rowLot ?? todayLot,
+        expiryDate: rowExpiry,
+        locationId: locationId,
+        locationCode: rowLocation,
+      ));
+    }
+
+    num totalKg = 0;
+    for (final plan in plans) {
+      totalKg += plan.quantity;
+    }
+
+    final newBatchKeys = <String>{};
+    for (final plan in plans) {
+      final product = plan.product;
+      if (product.id != null &&
+          batchByKey.containsKey('${product.id}|${plan.lotNumber}')) {
+        continue;
+      }
+      final productKey = product.id == null
+          ? 'new:${product.normalizedSku}'
+          : 'id:${product.id}';
+      newBatchKeys.add('$productKey|${plan.lotNumber}');
+    }
+
+    final summary = <String, dynamic>{
+      'new_products': plannedByNorm.length,
+      'created_batches': newBatchKeys.length,
+      'created_containers': plans.length,
+      'total_kg': totalKg,
+      'products_only': productsOnly,
+      'skipped_no_qty': skippedNoQty,
+    };
+
+    if (dryRun) {
+      return _jsonResponse(200, jsonEncode({
+        'ok': errors.isEmpty,
+        'errors': errors,
+        'summary': summary,
+      }));
+    }
+
+    if (errors.isNotEmpty) {
+      return _jsonResponse(422, jsonEncode({
+        'error': 'validation_failed',
+        'errors': errors,
+      }));
+    }
+
+    var createdProducts = 0;
+    var createdBatches = 0;
+    final createdContainers = <Map<String, dynamic>>[];
+    final barcodeSeq = <String, int>{};
+    final now = DateTime.now();
+    final datePart = datePartYYMMDD(now);
+
+    await connection.transaction((ctx) async {
+      for (final product in plannedByNorm.values) {
+        final inserted = await ctx.query(
+          'INSERT INTO products (organization_id, category_id, sku, name, unit, '
+          'attributes, default_container_type, default_unit_weight_kg, '
+          'default_shelf_life_days) '
+          'VALUES (@orgId, @categoryId, @sku, @name, \'kg\', '
+          '@attributes::jsonb, @containerType, @unitWeightKg, '
+          '@shelfLifeDays) RETURNING id',
+          substitutionValues: {
+            'orgId': organizationId,
+            'categoryId': product.categoryId,
+            'sku': product.sku,
+            'name': product.name,
+            'attributes': '{}',
+            'containerType': product.defaultContainerType,
+            'unitWeightKg': product.defaultUnitWeightKg,
+            'shelfLifeDays': product.shelfLifeMonths == null
+                ? null
+                : (product.shelfLifeMonths! * 30).round(),
+          },
+        );
+        product.id = inserted.first.first as int;
+        createdProducts++;
+      }
+
+      for (final plan in plans) {
+        final product = plan.product;
+        final productId = product.id!;
+        final batchKey = '$productId|${plan.lotNumber}';
+        var batchId = batchByKey[batchKey];
+        if (batchId == null) {
+          final existingBatch = await ctx.query(
+            'SELECT id FROM batches WHERE organization_id = @orgId '
+            'AND product_id = @productId AND lot_number = @lotNumber '
+            'ORDER BY id LIMIT 1',
+            substitutionValues: {
+              'orgId': organizationId,
+              'productId': productId,
+              'lotNumber': plan.lotNumber,
+            },
+          );
+          if (existingBatch.isNotEmpty) {
+            batchId = existingBatch.first.first as int;
+          } else {
+            final insertedBatch = await ctx.query(
+              'INSERT INTO batches (organization_id, product_id, lot_number, '
+              'expiry_date) VALUES (@orgId, @productId, @lotNumber, '
+              '@expiryDate) RETURNING id',
+              substitutionValues: {
+                'orgId': organizationId,
+                'productId': productId,
+                'lotNumber': plan.lotNumber,
+                'expiryDate': plan.expiryDate,
+              },
+            );
+            batchId = insertedBatch.first.first as int;
+            createdBatches++;
+          }
+          batchByKey[batchKey] = batchId;
+        }
+
+        final prefix = '${barcodeSkuPart(product.sku)}-$datePart-';
+        var seq = barcodeSeq[prefix];
+        if (seq == null) {
+          final existingCodes = await ctx.query(
+            'SELECT container_barcode FROM batch_containers '
+            'WHERE container_barcode LIKE @pattern',
+            substitutionValues: {'pattern': '$prefix%'},
+          );
+          seq = nextSeq(
+            existingCodes.map((row) => row[0] as String),
+            prefix,
+          );
+        }
+        final barcode = '$prefix${seq.toString().padLeft(2, '0')}';
+        barcodeSeq[prefix] = seq + 1;
+
+        final insertedContainer = await ctx.query(
+          'INSERT INTO batch_containers (batch_id, container_barcode, '
+          'quantity, location_id, unit_weight_kg) '
+          'VALUES (@batchId, @barcode, @quantity, @locationId, '
+          '@unitWeightKg) RETURNING id',
+          substitutionValues: {
+            'batchId': batchId,
+            'barcode': barcode,
+            'quantity': plan.quantity,
+            'locationId': plan.locationId,
+            'unitWeightKg': plan.unitWeightKg,
+          },
+        );
+        final containerId = insertedContainer.first.first as int;
+
+        if (plan.locationId != null) {
+          await ctx.execute(
+            'UPDATE storage_locations '
+            'SET current_units = current_units + @quantity '
+            'WHERE id = @locationId',
+            substitutionValues: {
+              'quantity': plan.quantity,
+              'locationId': plan.locationId,
+            },
+          );
+        }
+
+        createdContainers.add({
+          'container_id': containerId,
+          'container_barcode': barcode,
+          'sku': product.sku,
+          'product_name': product.name,
+          'unit_count': plan.unitCount,
+          'unit_weight_kg': plan.unitWeightKg,
+          'quantity': plan.quantity,
+          'location_code': plan.locationCode,
+        });
+      }
+    });
+
+    return _jsonResponse(201, jsonEncode({
+      'ok': true,
+      'summary': {
+        'new_products': createdProducts,
+        'created_batches': createdBatches,
+        'created_containers': createdContainers.length,
+        'total_kg': totalKg,
+        'products_only': productsOnly,
+        'skipped_no_qty': skippedNoQty,
+      },
+      'created_products': createdProducts,
+      'created_batches': createdBatches,
+      'created_containers': createdContainers.length,
+      'total_kg': totalKg,
+      'containers': createdContainers,
+    }));
   } finally {
     await connection.close();
   }
