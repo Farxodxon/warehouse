@@ -4,12 +4,27 @@ import 'dart:io';
 import 'package:http/http.dart';
 import 'package:test/test.dart';
 
-/// Live smoke test: ISHLAB TURGAN server va haqiqiy DB ga ulanadi.
+/// Live smoke test: alohida test backend va haqiqiy DB ga ulanadi.
 ///
-/// Ishga tushirish:
-///   Terminal 1: dart run bin/server.dart
-///   Terminal 2: dart test test/smoke_test.dart
-const _host = 'http://localhost:8080';
+/// Production'ga tasodifan urilmasligi uchun uchta muhit o'zgaruvchisi
+/// majburiy. Ular berilmasa test o'tkazib yuboriladi:
+///
+///   WMS_TEST_BASE_URL=https://<test-backend> \
+///   WMS_TEST_EMAIL=<test-email> \
+///   WMS_TEST_PASSWORD=<test-password> \
+///   dart test test/smoke_test.dart
+final _baseUrlRaw = Platform.environment['WMS_TEST_BASE_URL']?.trim() ?? '';
+final _email = Platform.environment['WMS_TEST_EMAIL']?.trim() ?? '';
+final _password = Platform.environment['WMS_TEST_PASSWORD'] ?? '';
+
+final _configured =
+    _baseUrlRaw.isNotEmpty && _email.isNotEmpty && _password.isNotEmpty;
+final _host = _baseUrlRaw.endsWith('/')
+    ? _baseUrlRaw.substring(0, _baseUrlRaw.length - 1)
+    : _baseUrlRaw;
+
+const _skipReason = 'WMS_TEST_BASE_URL, WMS_TEST_EMAIL va WMS_TEST_PASSWORD '
+    'berilmagan; live smoke test o\'tkazib yuborildi.';
 
 late String _token;
 
@@ -24,25 +39,23 @@ dynamic _decoded(Response r) =>
     r.body.isEmpty ? null : jsonDecode(utf8.decode(r.bodyBytes));
 
 void main() {
+  if (!_configured) {
+    test('live smoke test', () {}, skip: _skipReason);
+    return;
+  }
+
   setUpAll(() async {
     final h = await get(Uri.parse('$_host/health'));
     expect(h.statusCode, 200,
-        reason: 'Server ishlamayapti. Avval `dart run bin/server.dart` '
-            'terminalda ishga tushiring. Xato: ${h.body}');
+        reason: 'Test backend javob bermayapti (${h.statusCode}): ${h.body}');
     expect(_decoded(h), {'status': 'ok', 'database': 'connected'});
 
     final r = await post(Uri.parse('$_host/login'),
         headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'email': Platform.environment['WMS_TEST_EMAIL'] ?? 'admin@eclair.uz',
-          'password': Platform.environment['WMS_TEST_PASSWORD'] ?? 'Test1234!',
-        }));
+        body: jsonEncode({'email': _email, 'password': _password}));
     if (r.statusCode != 200) {
-      fail('Login muvaffaqiyatsiz (${r.statusCode}). TEST_LOGIN ni tekshiring '
-          'yoki muhit o\'zgaruvchilarini qo\'ying:\n'
-          '  \$env:WMS_TEST_EMAIL=...\n'
-          '  \$env:WMS_TEST_PASSWORD=...\n'
-          'Javob: ${r.body}');
+      fail('Login muvaffaqiyatsiz (${r.statusCode}). WMS_TEST_EMAIL va '
+          'WMS_TEST_PASSWORD qiymatlarini tekshiring. Javob: ${r.body}');
     }
     _token = (_decoded(r) as Map<String, dynamic>)['token'] as String;
   });

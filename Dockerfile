@@ -1,13 +1,9 @@
-# WMS backend — lokal Docker image.
+# WMS backend - Render Docker image.
 #
-# Build va ishga tushirish:
-#   docker build -t wms-backend .
-#   docker run -p 8080:8080 --env-file .env wms-backend
+# Render builds and runs this image. Runtime configuration comes from
+# environment variables in the Render dashboard.
 #
-# Eslatma: bu backend lokal Postgres'ga ulanadi. `docker run` paytida
-# `--network host` yoki compose'ning bitta tarmog'ini ishlatish kerak,
-# aks holda backend konteynerdagi localhost Postgres'ni ko'rmaydi.
-# Oddiy ishga tushirish uchun `dart run bin/server.dart` yetarli.
+# DATABASE_URL must point to Neon PostgreSQL and include sslmode=require.
 
 FROM dart:stable AS build
 

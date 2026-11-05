@@ -1,197 +1,155 @@
 # WMS Backend
 
 Eclair zavodi uchun ombor boshqaruv tizimi (WMS) backend servisi.
-Dart + Shelf freymvork, lokal PostgreSQL bazasi (Docker orqali).
+Dart + Shelf. Faqat bulutda ishlaydi:
 
-Barcha ma'lumot shu kompyuterda saqlanadi — bulut xizmatlariga bog'liq
-emas.
+- **Backend:** Render (`https://eclair-wms-app.onrender.com`)
+- **Ma'lumotlar bazasi:** Neon PostgreSQL
+- **Lokal backend, lokal PostgreSQL va Docker Compose ishlatilmaydi.**
 
-> **To'liq qo'llanma:** [QULLANMA.md](QULLANMA.md) — o'rnatish,
+> **To'liq qo'llanma:** [QULLANMA.md](QULLANMA.md) — Render/Neon sozlash,
 > foydalanish, rollar, Excel import, API ro'yxati va muammolarni hal qilish.
 
-## Ishga tushirish
+## Production
 
-1. Bog'liqliklarni o'rnating:
-
-```
-dart pub get
-```
-
-2. Postgres'ni ishga tushiring:
-
-```
-docker compose up -d
+```text
+Health:  https://eclair-wms-app.onrender.com/health
+API:     https://eclair-wms-app.onrender.com
+Render:  eclair-wms-app (Frankfurt, Docker)
+DB:      Neon PostgreSQL
 ```
 
-3. `.env` faylini yarating (namuna uchun `.env.example`ga qarang):
+Render bepul tarifda servis uxlab qolishi mumkin. Birinchi so'rov 30-60
+soniya kutishi mumkin, keyingi so'rovlar tez javob beradi.
 
-```
-cp .env.example .env
-```
+## Muhit o'zgaruvchilari
 
-Lokal Postgres uchun quyidagi qiymat to'g'ri keladi:
+Barcha qiymatlar **Render dashboard** orqali beriladi. Repo ichida `.env`
+fayli yo'q va real qiymatlar commit qilinmaydi.
 
-```
-DATABASE_URL=postgresql://wms:wms_local_dev@localhost:5432/wms
-```
+| O'zgaruvchi | Vazifasi |
+|---|---|
+| `DATABASE_URL` | Neon PostgreSQL, `sslmode=require` bilan |
+| `JWT_SECRET` | Token imzolash uchun uzun tasodifiy qator |
+| `PORT` | `8080` |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot tokeni (ixtiyoriy) |
+| `TELEGRAM_WEBHOOK_SECRET` | Webhook secret (ixtiyoriy) |
+| `TELEGRAM_CHAT_IDS` | Ruxsatli chat ID'lari (ixtiyoriy) |
 
-4. Migratsiyalarni ishga tushiring:
+`.env.example` faqat nomlar va Neon namunasi uchun. Uni Render'ga yuklamang.
 
-```
-dart run bin/migrate.dart
-```
+## Deploy
 
-5. Serverni ishga tushiring:
+1. O'zgarishlarni `main` branch'ga qo'shing.
+2. Render `autoDeploy: true` orqali yangi versiyani o'zi chiqaradi.
+3. Deploy tugagach health check:
 
-```
-dart run bin/server.dart
-```
-
-6. Boshqa terminal oynasida /health endpointni tekshiring:
-
-```
-curl -s localhost:8080/health
+```bash
+curl -s https://eclair-wms-app.onrender.com/health
 # {"status":"ok","database":"connected"}
+```
+
+Migratsiyalar Neon bazasiga bir marta qo'llaniladi. Yangi migratsiya
+qo'shilganda uni Render Shell yoki ishonchli admin muhitida `DATABASE_URL`
+bilan ishga tushiring:
+
+```bash
+dart run bin/migrate.dart
 ```
 
 ## Auth (JWT + bcrypt)
 
-### Migratsiyalarni ishga tushirish
-
-`lib/db/migrations/` papkasidagi `.sql` fayllar `bin/migrate.dart` orqali bajariladi
-(kuzatuv `schema_migrations` jadvalida yuritiladi, takror bajarilmaydi):
-
-```
-dart run bin/migrate.dart
-```
-
-### Endpointlar
-
-```
-# Dastlabki admin foydalanuvchini yaratish (faqat users bo'sh bo'lganda)
-curl -s -X POST localhost:8080/setup \
+```bash
+# Dastlabki admin (faqat users bo'sh bo'lganda)
+curl -s -X POST https://eclair-wms-app.onrender.com/setup \
   -H "Content-Type: application/json" \
-  -d '{"email":"admin@eclair.uz","password":"Test1234!","full_name":"Admin"}'
+  -d '{"email":"admin@eclair.uz","password":"<PAROL>","full_name":"Admin"}'
 
-# Login - JWT token oladi
-curl -s -X POST localhost:8080/login \
+# Login
+curl -s -X POST https://eclair-wms-app.onrender.com/login \
   -H "Content-Type: application/json" \
-  -d '{"email":"admin@eclair.uz","password":"Test1234!"}'
+  -d '{"email":"admin@eclair.uz","password":"<PAROL>"}'
 
-# Joriy foydalanuvchi (auth middleware orqali himoyalangan)
-curl -s localhost:8080/me -H "Authorization: Bearer <TOKEN>"
+# Joriy foydalanuvchi
+curl -s https://eclair-wms-app.onrender.com/me \
+  -H "Authorization: Bearer <TOKEN>"
 ```
 
-`.env`ga `JWT_SECRET` qatorini qo'shing (token imzolash uchun).
+## Organization / Warehouses
 
-## Organization / Warehouses (A3)
-
-Ichki, bitta tashkilot (Eclair) uchun: `organizations` jadvalda bitta yozuv avtomatik
-yaratiladi, `wareshouses` esa ko'p bo'lishi mumkin. Har bir omborga foydalanuvchining
-ruxsati `user_warehouse_access` jadvalida saqlanadi (role: `super_admin`,
+Bitta tashkilot (Eclair). Har bir omborga foydalanuvchi ruxsati
+`user_warehouse_access` jadvalida saqlanadi (`super_admin`,
 `warehouse_manager`, `operator`, `viewer`).
 
-Endpointlar (barchasi `Authorization: Bearer <TOKEN>` bilan himoyalangan):
+```bash
+# Omborlar
+curl -s https://eclair-wms-app.onrender.com/warehouses \
+  -H "Authorization: Bearer <TOKEN>"
 
-```
-# Omborlar ro'yxati (super_admin - hammasi, boshqa - faqat biriktirilgan)
-curl -s localhost:8080/warehouses -H "Authorization: Bearer <TOKEN>"
-
-# Yangi ombor (faqat super_admin; yaratuvchiga warehouse_manager roli beriladi)
-curl -s -X POST localhost:8080/warehouses \
+# Yangi ombor (super_admin)
+curl -s -X POST https://eclair-wms-app.onrender.com/warehouses \
   -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" \
   -d '{"name":"Tashkent-1","address":"Yunusobod","city":"Tashkent"}'
 
-# Ombor ma'lumoti
-curl -s localhost:8080/warehouses/1 -H "Authorization: Bearer <TOKEN>"
-
-# Omborga foydalanuvchi biriktirish (super_admin yoki warehouse_manager)
-curl -s -X POST localhost:8080/warehouses/1/users \
+# Foydalanuvchi biriktirish
+curl -s -X POST https://eclair-wms-app.onrender.com/warehouses/1/users \
   -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" \
   -d '{"user_id":2,"role":"operator"}'
-
-# Ombor foydalanuvchilari ro'yxati
-curl -s localhost:8080/warehouses/1/users -H "Authorization: Bearer <TOKEN>"
 ```
 
-## Lokal Postgres (Docker orqali)
+## Boshlang'ich qoldiq importi
 
-Bazaning barcha ma'lumoti shu noutbukda saqlanadi. `docker-compose.yml`
-Postgres 18 konteynerini 5432-portda ko'taradi va ma'lumotni `wms_pgdata`
-volume'ida saqlaydi — konteyner o'chirilsa ham yo'qolmaydi.
+Excel (`Qoldiq` varag'i) orqali mahsulot, partiya va konteynerlarni bir
+vaqtda yaratish:
 
-```
-docker compose up -d      # Postgres'ni ishga tushirish
-docker compose ps         # holatni ko'rish
-docker compose stop       # to'xtatish (ma'lumot saqlanadi)
-docker compose down       # o'chirish (volume saqlanadi)
+```bash
+curl -s -X POST \
+  'https://eclair-wms-app.onrender.com/inventory/opening-stock?dry_run=true' \
+  -H "Authorization: Bearer <TOKEN>" \
+  -H "Content-Type: application/json" \
+  --data-binary @opening-stock.json
 ```
 
-Konektsiya qatori `.env` da:
-
-```
-DATABASE_URL=postgresql://wms:wms_local_dev@localhost:5432/wms
-```
+`dry_run=true` hech narsa yozmaydi va xatolarni qaytaradi. Tekshiruvdan
+so'ng `dry_run`ni olib tashlang. Batafsil: [QULLANMA.md](QULLANMA.md).
 
 ## Testlar
 
-`test/smoke_test.dart` **ishlab turgan server va haqiqiy bazani** talab qiladi,
-shuning uchun avval serverni ishga tushiring:
+Birlik testlari tarmoq va bazasiz ishlaydi:
 
-```
-Terminal 1: dart run bin/server.dart
-Terminal 2: dart test test/smoke_test.dart
-```
-
-Login hisob ma'lumotlarini muhit orqali berish mumkin
-(`WMS_TEST_EMAIL` / `WMS_TEST_PASSWORD`).
-
-Eski `test/server_test.dart` — `shelf` scaffold qoldig'i bo'lib, WMS
-endpointlarini tekshirmaydi va `dart test` ni har doim qizil qoldiradi.
-
-
-## Telegram bot sozlash
-
-Chiqim (OUT/FEFO) xabarlari va `/qoldiq` buyrug'i uchun bot **webhook**
-rejimida ishlaydi (Render bepul tarifda uxlab qolgani uchun polling emas).
-Bot faqat o'qiydi: chiqim/kirim/tuzatish buyruqlari yo'q.
-
-Sozlash qadamlari:
-
-1. [@BotFather](https://t.me/BotFather) dan yangi bot yarating va
-   **token**ni oling (`TELEGRAM_BOT_TOKEN` uchun).
-2. Botni xabar yuborilmoqchi bo'lgan guruhga qo'shing.
-3. Render'da servis sozlamalariga 3 ta muhit o'zgaruvchisini qo'shing
-   (qiymatni kiriting, `sync: false`):
-
-   | O'zgaruvchi | Qiymat |
-   |---|---|
-   | `TELEGRAM_BOT_TOKEN` | BotFather bergan token |
-   | `TELEGRAM_WEBHOOK_SECRET` | Tasodifiy uzun matn (masalan: `openssl rand -hex 32`) |
-   | `TELEGRAM_CHAT_IDS` | Ruxsatli chat ID'lari, vergul bilan |
-
-4. Deploy'dan keyin guruhga `/id` yozing - bot `Bu chat ID: <raqam>`
-   javobini qaytaradi. Bu raqamni `TELEGRAM_CHAT_IDS`ga qo'shing va
-   servisni qayta deploy qiling.
-
-Webhook avtomatik ro'yxatdan o'tkaziladi: server ishga tushganda
-`RENDER_EXTERNAL_URL` (yoki `PUBLIC_BASE_URL`) asosida
-`<ommaviy manzil>/telegram/webhook` manziliga ulanadi.
-
-Tekshirish (guruhda):
-
-```
-/yordam          buyruqlar ro'yxati
-/id              chat ID raqami
-/qoldiq L001/2   mahsulot qoldig'i (SKU yoki nom bo'yicha)
+```bash
+dart analyze
+dart test
 ```
 
-Eslatma: token va secret qiymatlari README'ga, loglarga va commit'ga
-yozilmaydi. Env bo'sh bo'lsa webhook o'chiq turadi (`404`), server
-ishlashda davom etadi.
+Live smoke test faqat aniq test backend'ga qarshi ishlaydi. Production'ga
+tasodifan urilmasligi uchun muhit o'zgaruvchilari majburiy:
 
-Birlik testlari (tarmoq va bazasiz):
+```bash
+WMS_TEST_BASE_URL=https://<test-backend> \
+WMS_TEST_EMAIL=<test-email> \
+WMS_TEST_PASSWORD=<test-password> \
+dart test test/smoke_test.dart
+```
 
-```
-dart test test/telegram_test.dart
-```
+`test/smoke_test.dart` muhit o'zgaruvchilari berilmasa o'tkazib yuboriladi.
+Haqiqiy foydalanuvchi parolini repo'ga yoki test fayliga yozmang.
+
+## Telegram bot
+
+Chiqim (OUT/FEFO) xabarlari va `/qoldiq` buyrug'i webhook rejimida ishlaydi
+(Render bepul tarifda polling ishlamaydi). Bot faqat o'qiydi.
+
+Render dashboard'ga qo'shing:
+
+| O'zgaruvchi | Qiymat |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | BotFather bergan token |
+| `TELEGRAM_WEBHOOK_SECRET` | Tasodifiy uzun matn |
+| `TELEGRAM_CHAT_IDS` | Ruxsatli chat ID'lari, vergul bilan |
+
+Webhook `RENDER_EXTERNAL_URL` (yoki `PUBLIC_BASE_URL`) asosida avtomatik
+ro'yxatdan o'tadi. Tekshirish: guruhda `/id` va `/qoldiq L001/2`.
+
+Token va secret qiymatlari README'ga, loglarga va commit'ga yozilmaydi.
+Env bo'sh bo'lsa webhook o'chiq turadi (`404`), server ishlashda davom etadi.

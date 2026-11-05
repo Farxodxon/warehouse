@@ -37,7 +37,7 @@ Request _updateRequest({
   if (secret != null) headers['x-telegram-bot-api-secret-token'] = secret;
   return Request(
     'POST',
-    Uri.parse('http://localhost/telegram/webhook'),
+    Uri.parse('https://telegram.invalid/telegram/webhook'),
     headers: headers,
     body: jsonEncode({
       'update_id': 1,
@@ -172,8 +172,8 @@ void main() {
     });
 
     test('vaqt Toshkent (UTC+5)', () {
-      expect(tashkentTime(DateTime.utc(2026, 10, 16, 12, 5)),
-          '16.10.2026 17:05');
+      expect(
+          tashkentTime(DateTime.utc(2026, 10, 16, 12, 5)), '16.10.2026 17:05');
       expect(
           tashkentTime(DateTime.utc(2026, 1, 1, 19, 30)), '02.01.2026 00:30');
     });
@@ -368,7 +368,7 @@ void main() {
       final response = await handleTelegramWebhook(
         Request(
           'POST',
-          Uri.parse('http://localhost/telegram/webhook'),
+          Uri.parse('https://telegram.invalid/telegram/webhook'),
           headers: {
             'content-type': 'application/json',
             'x-telegram-bot-api-secret-token': 'test-secret',

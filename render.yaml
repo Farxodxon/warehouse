@@ -1,6 +1,9 @@
+# Render production service.
+# Backend: https://eclair-wms-app.onrender.com
+# Database: Neon PostgreSQL (DATABASE_URL is set in the Render dashboard).
 services:
   - type: web
-    name: eclair-wms-backend
+    name: eclair-wms-app
     runtime: docker
     region: frankfurt
     dockerfilePath: ./Dockerfile

@@ -1,726 +1,481 @@
-# Eclair WMS — To'liq qo'llanma
+# Eclair WMS - To'liq qo'llanma
 
-Ombor boshqaruv tizimi (WMS) uchun to'liq qo'llanma: o'rnatish, foydalanish,
-texnik arxitektura va muammolarni hal qilish.
+Ombor boshqaruv tizimi (WMS) uchun qo'llanma: bulut arxitekturasi,
+Render/Neon sozlash, foydalanish, API va muammolarni hal qilish.
+
+**Production muhiti faqat bulutda:**
+
+- Backend: Render - `https://eclair-wms-app.onrender.com`
+- Ma'lumotlar bazasi: Neon PostgreSQL
+- Ilova: Flutter (macOS/Windows/mobil), bulut backend'ga ulanadi
 
 ---
 
 ## Mundarija
 
 1. [Tizim haqida](#1-tizim-haqida)
-2. [Tuzilma](#2-tuzilma)
-3. [O'rnatish](#3-ornatish)
-4. [Ishga tushirish](#4-ishga-tushirish)
-5. [Foydalanish — amaliy qo'llanma](#5-foydalanish--amaliy-qollanma)
-6. [Excel orqali mahsulot importi](#6-excel-orqali-mahsulot-importi)
+2. [Bulut arxitekturasi](#2-bulut-arxitekturasi)
+3. [Render va Neon](#3-render-va-neon)
+4. [Ilovani ishga tushirish](#4-ilovani-ishga-tushirish)
+5. [Foydalanish](#5-foydalanish)
+6. [Excel importi](#6-excel-importi)
 7. [Rollar va ruxsatlar](#7-rollar-va-ruxsatlar)
 8. [Texnik arxitektura](#8-texnik-arxitektura)
 9. [Ma'lumotlar bazasi](#9-malumotlar-bazasi)
 10. [API ro'yxati](#10-api-royxati)
 11. [Testlar](#11-testlar)
 12. [Muammolar va yechimlar](#12-muammolar-va-yechimlar)
-13. [Keyingi bosqichlar](#13-keyingi-bosqichlar)
+13. [Xavfsizlik](#13-xavfsizlik)
 
 ---
 
 ## 1. Tizim haqida
 
-Eclair zavodi uchun mo'ljallangan ombor boshqaruv tizimi. Mahsulot, partiya,
-konteyner va joylashuvlarni boshqaradi; kim chiqim qilganini, qayerdan
-qayeriga ko'chirilganini va sifat tekshiruvini qayd etadi.
-
-**Asosiy imkoniyatlar:**
+Eclair zavodi uchun ombor boshqaruv tizimi. Mahsulot, partiya, konteyner
+va joylashuvlarni boshqaradi; chiqim, ko'chirish, sifat tekshiruvi va
+qoldiq tarixini yuritadi.
 
 | Imkoniyat | Tavsif |
 |---|---|
-| Omborlar va zonalar | Ko'p ombor, har birida zonalar (sovuq/&quruq/karantin) va joylashuv kodi |
-| Dinamik mahsulotlar | Kategoriya orqali har bir mahsulot turiga o'z atributlarini berish |
-| Partiya (lot) | Ishlab chiqarilgan/muddati, sifat holati, tekshiruv tarixi |
-| Konteyner | Har bir fizik konteyner = shtrix-kod + qoldiq + joylashuv |
-| FEFO | Eng muddati yaqin partiyadan birinchi chiqarish |
-| Sifat nazorati | Tekshiruvda → Tasdiqlangan / Karantin / Rad etilgan |
-| Ogohlantirish | 7 va 30 kunlik muddat ogohlantirishlari |
-| Hisobotlar | Qoldiq va harakatlar hisoboti (.xlsx) |
-| Skaner | Kameradan shtrix-kod o'qish |
-| Yorliqlar | QR kodli yorliqlar PDF chiqarish (A4, 67×37 mm) |
-
-**Ma'lumotlar qayerda saqlanadi:** butun ma'lumot shu kompyuterda, Docker
-konteyneridagi PostgreSQL 18 da. Bulut xizmatlariga bog'liq emas — internet
-uzilsa ham ishlaydi. Ma'lumot `wms_pgdata` Docker volume'ida turadi.
+| Omborlar va zonalar | Ko'p ombor, sovuq/quruq/karantin zonalari, joylashuv kodi |
+| Dinamik mahsulotlar | Kategoriya bo'yicha atributlar (matn, son, ha/yo'q, sana) |
+| Partiya (lot) | Yaroqlilik muddati, sifat holati, tekshiruv tarixi |
+| Konteyner | Har bir fizik idish = shtrix-kod + qoldiq + joylashuv |
+| FEFO | Eng yaqin muddatli partiyadan birinchi chiqarish |
+| Sifat nazorati | Tekshiruvda, tasdiqlangan, karantin, rad etilgan |
+| Ogohlantirishlar | 7 va 30 kunlik muddat ogohlantirishlari |
+| Hisobotlar | Qoldiq va harakatlar `.xlsx` hisobotlari |
+| Skaner | Shtrix-kodni kameradan o'qish |
+| Yorliqlar | QR kodli PDF yorliqlar (67x37 mm) |
+| Boshlang'ich qoldiq | Excel orqali mahsulot + partiya + konteyner importi |
 
 ---
 
-## 2. Tuzilma
+## 2. Bulut arxitekturasi
 
-Ikki alohida repositoriya bor:
-
-```
-Default Project/
-├── warehouse/          ← Backend (Dart + Shelf + PostgreSQL)
-│   ├── bin/
-│   │   ├── server.dart     ← HTTP server, 42 ta endpoint
-│   │   └── migrate.dart    ← migratsiyalarni ishga tushirish
-│   ├── lib/
-│   │   ├── auth/           ← JWT, bcrypt, ruxsatlar
-│   │   ├── db/
-│   │   │   ├── connection.dart   ← PostgreSQL ulanishi
-│   │   │   └── migrations/       ← 13 ta .sql fayl
-│   │   ├── inventory/      ← FEFO, ogohlantirish, sifat
-│   │   ├── products/       ← atributlar, validatsiya, joylashuv kodi
-│   │   └── reports/        ← Excel hisobotlar
-│   ├── test/
-│   ├── docker-compose.yml ← lokal Postgres
-│   └── .env               ← ulanish sozlamalari (git ga kirmaydi)
-│
-└── eclair-wms-app/     ← Frontend (Flutter)
-    └── lib/
-        ├── core/           ← API klient, konfiguratsiya
-        └── features/
-            ├── auth/       ← login
-            ├── warehouses/ ← omborlar, zonalar, joylashuvlar
-            ├── products/   ← mahsulot, partiya, konteyner, import
-            ├── scanner/    ← kamera skaneri
-            ├── quality/    ← sifat nazorati
-            ├── alerts/     ← muddat ogohlantirishlari
-            ├── labels/     ← QR yorliqlar
-            └── reports/    ← hisobotlar
+```text
+Flutter ilova (macOS / Windows / mobil)
+        |
+        | HTTPS + JWT
+        v
+Render: eclair-wms-app (Frankfurt, Docker)
+        |
+        | DATABASE_URL (sslmode=require)
+        v
+Neon PostgreSQL
 ```
 
-Backend stateless — u hech narsani diskka yozmaydi. Har bir so'rovda
-PostgreSQL'ga ulanadi. Ma'lumot faqat bazada.
+- Backend stateless: ma'lumot faqat Neon bazasida saqlanadi.
+- Render bepul tarifda servis uxlab qolishi mumkin. Birinchi so'rov
+  30-60 soniya davom etishi mumkin.
+- Backend va baza bitta joyda - Render va Neon. Boshqa backend ishlatilmaydi.
 
 ---
 
-## 3. O'rnatish
+## 3. Render va Neon
 
-### Talablar
+### Render servisi
 
-| Dastur | Versiya | Izoh |
-|---|---|---|
-| Docker Desktop | 29+ | Postgres konteyneri uchun |
-| Dart SDK | 3.2.6+ | 3.12.2 sinab ko'rilgan |
-| Flutter | 3.10+ | 3.44.6 sinab ko'rilgan |
+`render.yaml` quyidagi servisni tavsiflaydi:
 
-Tekshirish:
-
-```powershell
-dart --version
-flutter --version
-docker --version
+```yaml
+services:
+  - type: web
+    name: eclair-wms-app
+    runtime: docker
+    region: frankfurt
+    autoDeploy: true
+    healthCheckPath: /health
 ```
 
-### Backend
+Render dashboard'da muhit o'zgaruvchilari:
 
-```powershell
-cd warehouse
-dart pub get
+| O'zgaruvchi | Vazifasi |
+|---|---|
+| `DATABASE_URL` | Neon PostgreSQL ulanish qatori (`sslmode=require`) |
+| `JWT_SECRET` | Token imzolash uchun uzun tasodifiy qator |
+| `PORT` | `8080` |
+| `TELEGRAM_BOT_TOKEN` | BotFather tokeni (ixtiyoriy) |
+| `TELEGRAM_WEBHOOK_SECRET` | Webhook secret (ixtiyoriy) |
+| `TELEGRAM_CHAT_IDS` | Ruxsatli chat ID'lari (ixtiyoriy) |
+
+Real qiymatlar faqat Render dashboard'da saqlanadi. Repo'ga, README'ga
+yoki commit'ga yozilmaydi.
+
+### Neon bazasi
+
+Neon dashboard'dan connection string olinadi va Render'ning
+`DATABASE_URL` qiymatiga qo'yiladi. Namunasi:
+
+```text
+postgresql://USER:PASSWORD@HOST.neon.tech/DBNAME?sslmode=require
 ```
 
-### `.env` fayli
+`sslmode=require` majburiy - Neon TLS talab qiladi.
 
-`.env.example` dan nusxa oling:
+### Deploy va migratsiyalar
 
-```powershell
-Copy-Item .env.example .env
-```
+1. O'zgarishlarni `main` branch'ga qo'shing.
+2. Render `autoDeploy: true` orqali yangi versiyani chiqaradi.
+3. Health check:
 
-Lokal Postgres uchun quyidagi qiymatlar to'g'ri keladi:
-
-```ini
-DATABASE_URL=postgresql://wms:wms_local_dev@localhost:5432/wms
-JWT_SECRET=uzun-tasodifiy-qator
-PORT=8080
-```
-
-`JWT_SECRET` — token imzolash kaliti. Hech qachon real qiymatni
-`git commit` qilmang, `.env` `.gitignore`da bor.
-
-### Frontend
-
-```powershell
-cd eclair-wms-app
-flutter pub get
-```
-
-Frontend va backend aloqasi `API_BASE_URL` orqali sozlanadi
-(`lib/core/config.dart`). Default `http://localhost:8080`, ya'ni o'zgartirish
-shart emas.
-
----
-
-## 4. Ishga tushirish
-
-Har bir ishga tushirishda **ikki alohida terminal** kerak.
-
-### Terminal 1 — ma'lumotlar bazasi
-
-```powershell
-cd warehouse
-docker compose up -d
-```
-
-Tekshirish:
-
-```powershell
-docker compose ps
-# STATUS: Up ... (healthy)
-```
-
-### Terminal 2 — backend server
-
-```powershell
-cd warehouse
-dart run bin/migrate.dart      # faqat birinchi marta
-dart run bin/server.dart
-```
-
-`Server running on http://localhost:8080` chiqishi kerak.
-
-### Tekshirish
-
-```powershell
-curl -s localhost:8080/health
+```bash
+curl -s https://eclair-wms-app.onrender.com/health
 # {"status":"ok","database":"connected"}
 ```
 
-### Terminal 3 — ilova
+Yangi SQL migratsiya qo'shilsa, uni Neon bazasiga bir marta qo'llang:
 
-```powershell
+```bash
+dart run bin/migrate.dart
+```
+
+Buyruq `DATABASE_URL`ni Render'dagi Neon qiymati bilan olishi kerak.
+Migratsiyalar `schema_migrations` jadvalida kuzatiladi va takror
+bajarilmaydi.
+
+---
+
+## 4. Ilovani ishga tushirish
+
+Ilova default holatda Render backend'ga ulanadi:
+
+```bash
 cd eclair-wms-app
+flutter pub get
+flutter run -d macos
+```
+
+Windows:
+
+```bash
 flutter run -d windows
 ```
 
-Yoki oldindan build qilib ishga tushirish:
+Manzil `lib/core/config.dart` da:
 
-```powershell
-flutter build windows --debug
-.\build\windows\x64\runner\Debug\wms_app.exe
+```dart
+const String _defaultServerUrl = String.fromEnvironment(
+  'API_BASE_URL',
+  defaultValue: 'https://eclair-wms-app.onrender.com',
+);
 ```
 
-### To'xtatish
+Boshqa bulut muhiti kerak bo'lsa, faqat HTTPS manzil bering:
 
-```powershell
-docker compose stop            # ma'lumot saqlanadi
-Ctrl+C                        # server terminalda
+```bash
+flutter run -d macos \
+  --dart-define=API_BASE_URL=https://<bulut-backend>
 ```
 
-### Boshqa qurilmadan ulanish
-
-Tarmoq orqali (telefon, boshqa kompyuter):
-
-```powershell
-ipconfig | Select-String "IPv4"
-curl -s http://172.20.10.12:8080/health
-```
-
-8080-port ochiq bo'lishi kerak (bir marta admin sifatida):
-
-```powershell
-New-NetFirewallRule -DisplayName "WMS Backend 8080" `
-  -Direction Inbound -LocalPort 8080 -Protocol TCP -Action Allow
-```
+Production ilova uchun `https://eclair-wms-app.onrender.com` ishlatiladi.
 
 ---
 
-## 5. Foydalanish — amaliy qo'llanma
+## 5. Foydalanish
 
 ### 5.1 Kirish
 
-`Tizimga kirish` ekranida email va parol. Muvaffaqiyatli kirishdan keyin
-**Omborlar** ro'yxati ochiladi.
-
-Birinchi admin foydalanuvchisini yaratish (faqat `users` jadvali bo'sh
-bo'lsa):
-
-```powershell
-curl -s -X POST localhost:8080/setup `
-  -H "Content-Type: application/json" `
-  -d '{"email":"admin@eclair.uz","password":"Test1234!","full_name":"Admin"}'
-```
-
-> Muhim: hozir bazada 2 ta foydalanuvchi bor, shuning uchun `/setup` 403
-> qaytaradi (`already_initialized`).
+Email va parol bilan kiriladi. Muvaffaqiyatli kirishdan keyin omborlar
+ro'yxati ochiladi. Token 7 kun amal qiladi va ilova yopilganda saqlanmaydi.
 
 ### 5.2 Bosh menyu
 
-Omborlar ekranining yuqori panelida barcha bo'limlar:
-
 | Tugma | Vazifasi |
 |---|---|
-| Skaner | Kameradan shtrix-kod o'qish |
-| Yorliqlar | QR yorliqlar PDF chiqarish |
-| Mahsulotlar | Mahsulotlar ro'yxati, qo'shish, Excel import |
-| Hisobotlar | Excel hisobot yuklab olish (boshqaruvchilar uchun) |
-| 🔔 | Muddat ogohlantirishlari (raqam bilan) |
-| ✅ | Sifat tekshiruv navbati (raqam bilan) |
-| ↪ | Chiqish |
+| Skaner | Shtrix-kodni o'qish |
+| Yorliqlar | QR yorliqlarni PDF chiqarish |
+| Mahsulotlar | Mahsulotlar, partiyalar, Excel import |
+| Hisobotlar | Qoldiq va harakatlar hisoboti |
+| Ogohlantirishlar | Muddati yaqin partiyalar |
+| Sifat | Tekshiruv navbati |
+| Yuklash | Boshlang'ich qoldiq importi |
+| Chiqish | Tizimdan chiqish |
 
-### 5.3 Omborlar va joylashuvlar
+### 5.3 Omborlar, zonalar, joylashuvlar
 
-**Omborlar** ro'yxatidan birini tanlang. Unda ikki tab bor:
+Ombor tanlangach ikki tab ochiladi:
 
-**Zonalar** — omborning mantiqiy qismlari. `Zona qo'shish` bilan qo'shiladi:
-
-- Nomi (majburiy)
-- Turi: sovuq saqlash / quruq saqlash / karantin / boshqa
-
-**Joylashuvlar** — aniq saqlash o'rni. `Joylashuv qo'shish` orqali:
-
-| Maydon | Misol | Majburiy |
-|---|---|---|
-| Zona | (tanlanadi) | yo'q |
-| Aisle | `A` | ha |
-| Rack | `03` | ha |
-| Shelf | `02` | ha |
-| Bin | `01` | ha |
-| Sig'imi | `500` | yo'q |
-
-Kod avtomatik yig'iladi: `A-03-02-01`. Har bir omborda kod takrorlanmaydi.
+- **Zonalar** - sovuq saqlash, quruq saqlash, karantin, boshqa.
+- **Joylashuvlar** - aisle, rack, shelf, bin. Kod avtomatik yig'iladi,
+  masalan `A-03-02-01`. Har bir omborda kod takrorlanmaydi.
 
 ### 5.4 Mahsulotlar
 
-`Mahsulotlar` → qo'shish tugmasi. Quyidagilar kiritiladi:
-
-- Kategoriya (majburiy)
-- SKU (majburiy, tashkilot ichida takrorlanmaydi)
-- Nomi (majburiy)
-- Birlik: `kg`, `dona`, `litr` (majburiy)
-- Shtrix-kod (ixtiyoriy)
-- Min / Max zaxira (ixtiyoriy)
-
-**Kategoriya atributlari:** kategoriya tanlanganida uning atributlar shakllari
-avtomatik paydo bo'ladi. Masalan "Xom ashyo" kategoriyasi `saqlash harorati`
-(`text`), `ishlatish maqsadi` (`text`) atributlarini talab qilishi mumkin.
-Turlar: matn, son, ha/yo'q, sana.
-
-**Qayerda?** — mahsulot qaysi joylashuvda qancha turganini ko'rsatadi
-(ombor, zona, kod, lot, miqdor).
+Mahsulot uchun kategoriya, SKU, nomi, birlik (`kg`, `dona`, `litr`),
+shtrix-kod va min/max zaxira kiritiladi. Kategoriya tanlanganda uning
+atributlari avtomatik chiqadi.
 
 ### 5.5 Partiya va konteyner
 
-**Partiya (lot)** — bir marta kelgan mahsulot partiyasi. Lot raqami, ishlab
-chiqarilgan sana, muddati va sifat holati bilan.
+Partiya - bir kelgan mahsulot to'plami: lot raqami, muddat, sifat holati.
+Konteyner - fizik idish: shtrix-kod, miqdor va joylashuv.
 
-**Konteyner** — fizik idish (palet, quti). Har biriga shtrix-kod beriladi va
-u ma'lum joylashuvga qo'yiladi. Asosiy ish amaliyoti shu yerda:
+Asosiy amallar:
 
 | Amal | Vazifasi |
 |---|---|
-| Chiqarish (OUT) | Omibordan chiqarish. Qolgan miqdor ko'rsatiladi |
+| Chiqarish (OUT) | Ombordan chiqarish |
 | Ko'chirish (TRANSFER) | Boshqa joylashuvga ko'chirish |
-| Tuzatish (ADJUSTMENT) | Qoldiqni to'g'rilash. **Izoh majburiy** |
+| Tuzatish (ADJUSTMENT) | Qoldiqni to'g'rilash; izoh majburiy |
 
-Har bir amal `inventory_transactions` jadvaliga yoziladi: kim, qachon, qayerdan,
-qayeriga, qancha. Bu **audit izi** — hech qanday o'zgarish yashirilmaydi.
+Har bir amal `inventory_transactions` jadvaliga yoziladi: kim, qachon,
+qayerdan, qayeriga, qancha.
 
 ### 5.6 Sifat nazorati
 
-Partiya `Tekshiruvda` holatidan chiqishi kerak:
-
-```
-Tekshiruvda → Tasdiqlangan | Karantin | Rad etilgan
-Karantin   → Tasdiqlangan | Rad etilgan
-Tasdiqlangan → Karantin | Rad etilgan
-Rad etilgan → (yakuniy, qaytib bo'lmaydi)
+```text
+Tekshiruvda -> Tasdiqlangan | Karantin | Rad etilgan
+Karantin    -> Tasdiqlangan | Rad etilgan
+Tasdiqlangan -> Karantin | Rad etilgan
+Rad etilgan -> yakuniy
 ```
 
-Har bir o'zgarishga **izoh majburiy** va kim o'zgartirgani saqlanadi.
-Faqat `Tasdiqlangan` partiyalar FEFO va ogohlantirishlarda hisobga olinadi.
+Har bir o'zgarishga izoh majburiy. Faqat `approved` partiyalar FEFO va
+ogohlantirishlarda hisobga olinadi.
 
-### 5.7 Ogohlantirishlar
+### 5.7 Ogohlantirishlar va hisobotlar
 
-🔔 tugmasi muddati yaqinlashgan partiyalarni ko'rsatadi. 7 kun yoki 30
-kunlik filtr. Ranglar:
-
-| Rang | Holat |
-|---|---|
-| Qizil | Muddati o'tgan |
-| Sariq/oranj | 7 kundan kam qoldi |
-| Sariq | Ko'proq qoldi |
-
-Bitta qator bir nechta joylashuvda bo'lsa, hammasi ko'rsatiladi.
-
-### 5.8 Hisobotlar
-
-**Qoldiq hisoboti** — joriy qoldiq: mahsulot, SKU, kategoriya, lot, muddat,
-konteyner, miqdor, ombor, zona, joylashuv kodi. 7 kundan kam qolgan
-qatorlar qizilga bo'yaladi.
-
-**Harakatlar hisoboti** — sana oralig'ida bo'lgan barcha OUT / TRANSFER /
-ADJUSTMENT. Qator rangi turga bog'liq: OUT qizil, TRANSFER ko'k, ADJUSTMENT
-sariq.
-
-Ikkalasida ombor filtri ixtiyoriy. Fayl `Downloads` papkasiga saqlanadi.
+Ogohlantirishlar 7 yoki 30 kunlik filtr bilan ko'rsatiladi. Qoldiq
+hisobotida mahsulot, SKU, lot, muddat, konteyner, miqdor, ombor va
+joylashuv bo'ladi. Harakatlar hisoboti sana oralig'idagi OUT, TRANSFER va
+ADJUSTMENT amallarini ko'rsatadi.
 
 ---
 
-## 6. Excel orqali mahsulot importi
+## 6. Excel importi
 
-Ko'p mahsulotni bir vaqtda kiritish uchun.
+### 6.1 Boshlang'ich qoldiq importi
 
-`Mahsulotlar` ekranida Excel ikonkasi → `.xlsx` faylni tanlang →
-varaqni tanlang → ustunlarni tekshiring → kategoriya tanlang →
-**Yuborish**.
+`Yuklash` tugmasi orqali `.xlsx` fayl tanlanadi. Ilova `Qoldiq` varag'ini
+oladi (bo'lmasa birinchi varaq).
 
-### Ustunlarni avtomatik aniqlash
+Majburiy ustunlar:
 
-Ilova birinchi qatorni sarlavha deb oladi (agar `Sarlavha qatori` belgilangan
-bo'lsa) va har bir ustunni o'zi nomi bo'yicha tanib oladi:
-
-| Sarlavhada qidiriladi | Vazifasi |
+| Ustun | Vazifasi |
 |---|---|
-| `код`, `sku`, `code` | SKU |
-| `ном`, `назв`, `name` | Nomi |
-| `муддат`, `ярокл`, `яроқл`, `срок`, `shelf` | Yaroqlilik muddati |
-| `№`, `no`, `n` | Tartib raqami (SKU generatsiya uchun) |
-| Kategoriya atributlari `label` yoki `key` bo'yicha | Atribut |
+| `Kod` yoki `SKU` | Mahsulot SKU'si |
+| `Idish soni` | Fizik idishlar soni |
 
-Birinchi topilgan ustun **nomi** bo'ladi. SKU ustuni topilmasa va SKU
-belgilanmagan bo'lsa, SKU avtomatik yaratiladi: `PLK-<tartib raqami>`.
-Prefix o'zgartirilishi mumkin.
+Qo'shimcha ustunlar:
 
-Har bir ustun uchun ro'yxatdan **qo'lda** tanlash mumkin: *E'tiborsiz
-qoldirish / SKU (kod) / Nomi / Yaroqlilik muddati / Tartib raqam /
-atributlar...*
-
-### Yaroqlilik muddati
-
-`Oylarda` belgilangan bo'lsa, qiymat **30 kunlik** ko'paytiriladi.
-Masalan 24 oy → 720 kun. Aks holda qiymat kun sifatida o'qiladi.
-
-### Qatorlar nima uchun o'tkazilmaydi
-
-| Sabab | Tushuntirish |
+| Ustun | Vazifasi |
 |---|---|
-| Nomi yo'q | Nomi ustuni bo'sh |
-| SKU yo'q | SKU belgilangan, lekin qator bo'sh |
-| Faylda takrorlangan SKU | Bir faylda SKU ikki marta |
-| Bazada allaqachon bor | Bu SKU bazada mavjud |
+| `Nomi` | Mahsulot nomi (yangi mahsulot uchun) |
+| `Kategoriya` | Kategoriya nomi |
+| `Idish turi` | Masalan `qop`, `baraban` |
+| `1 idish, kg` | Bitta idish og'irligi |
+| `Lot raqami` | Partiya raqami; bo'sh bo'lsa `BQ-YYMMDD` |
+| `Yaroqlilik muddati` | `YYYY-MM-DD`, `DD.MM.YYYY` yoki Excel sana |
+| `Joylashuv kodi` | Ombor tanlangan bo'lsa, masalan `A-01-2-3` |
+| `Yaroqlilik (oy)` | Yangi mahsulot uchun saqlash muddati (oy) |
 
-O'tkazilmagan qatorlar sababi bilan ko'rsatiladi. Biror qator xato
-bo'lsa, qolganlari to'xtamaydi — import `5` tadan iborat guruhlarda
-ketma-ket yuboriladi.
+Ish tartibi:
 
-### Namuna jadval
+1. Faylni tanlang.
+2. Ombor va standart kategoriyani tanlang.
+3. **Tekshirish** - `dry_run`, hech narsa yozmaydi, xatolarni ko'rsatadi.
+4. Xatolar bo'lmasa **Import qilish** - bitta tranzaksiyada yoziladi.
+5. Natijadagi konteynerlar uchun QR yorliqlarni chop eting.
 
-```
-| SKU    | Nomi              | Yaroqlilik (oy) | Saqlash harorati | Ishlatish     |
-|--------|-------------------|----------------|------------------|---------------|
-| PLK-001| Sodium laureth    | 24             | 15-25            | Yuvish        |
-| PLK-002| Plyonka 60 mk     | 36             | 5-25             | Qadovlash     |
-```
+Xatolar qator raqami bilan qaytariladi. Xato bo'lsa import to'liq
+to'xtaydi va hech narsa yozilmaydi.
 
-Shu jadval `.xlsx` ko'rinishida bo'lsa, barcha ustunlar avtomatik
-aniqlanadi.
+Muhim:
+
+- SKU'dagi kirill homogliflari avtomatik lotinga almashtiriladi.
+- Shtrix-kod: `<SKU>-YYMMDD-NN`, masalan `L-001-2-261105-01`.
+- Bir xil mahsulot va lot mavjud bo'lsa, yangi partiya yaratilmaydi.
+- `Idish soni = 0` bo'lsa, faqat mahsulot kartasi yaratiladi (nom bo'lsa).
+- Qayta import qilinsa qoldiq ikki baravar bo'ladi.
+
+### 6.2 Mahsulotlarni ommaviy import qilish
+
+`Mahsulotlar` ekranidagi Excel tugmasi orqali ko'p mahsulot kartasini
+yaratish mumkin. Ilova sarlavhalarni avtomatik aniqlaydi yoki ustunlarni
+qo'lda moslashtirish imkonini beradi.
 
 ---
 
 ## 7. Rollar va ruxsatlar
 
-Bitta foydalanuvchi bir nechta omborda turli rol bilan ishlashi mumkin
-(`user_warehouse_access` jadvali). Rol `users.role` da **global**, ombor roli
-**mahalliy**.
-
-| Rol | Qayerda | Nimaga qodir |
+| Rol | Qayerda | Huquqlar |
 |---|---|---|
-| `super_admin` | global | Hammasi. Barcha omborlar, barcha hisobotlar |
-| `warehouse_manager` | ombor | Mahsulot yaratish, zona/joylashuv, sifat, hisobot, ro'l berish |
-| `operator` | ombor | Chiqarish, ko'chirish, tarix ko'rish |
+| `super_admin` | global | Hammasi, barcha omborlar |
+| `warehouse_manager` | ombor | Mahsulot, zona/joylashuv, sifat, hisobot |
+| `operator` | ombor | OUT, TRANSFER, tarix |
 | `viewer` | ombor | Faqat ko'rish |
-
-### Amallar bo'yicha
 
 | Amal | super_admin | warehouse_manager | operator | viewer |
 |---|---|---|---|---|
-| Mahsulot ro'yxati (o'z ombori) | ✅ | ✅ | ✅ | ✅ |
-| Mahsulot qo'shish/tahrirlash | ✅ | ✅ | ❌ | ❌ |
-| Kategoriya yaratish | ✅ | ❌ | ❌ | ❌ |
-| Zona / joylashuv qo'shish | ✅ | ✅ | ❌ | ❌ |
-| Partiya / konteyner qo'shish | ✅ | ✅ | ✅ | ❌ |
-| OUT / TRANSFER | ✅ | ✅ | ✅ | ❌ |
-| ADJUSTMENT | ✅ | ✅ | ❌ | ❌ |
-| Sifat holatini o'zgartirish | ✅ | ✅ | ❌ | ❌ |
-| Hisobotlar | ✅ | ✅ | ❌ | ❌ |
-| Omborga foydalanuvchi biriktirish | ✅ | ✅ (o'z ombori) | ❌ | ❌ |
-| Yangi ombor yaratish | ✅ | ❌ | ❌ | ❌ |
-| Yangi kategoriya yaratish | ✅ | ❌ | ❌ | ❌ |
+| Mahsulot ko'rish | ha | ha | ha | ha |
+| Mahsulot qo'shish/tahrirlash | ha | ha | yo'q | yo'q |
+| Kategoriya yaratish | ha | yo'q | yo'q | yo'q |
+| Zona/joylashuv qo'shish | ha | ha | yo'q | yo'q |
+| Partiya/konteyner qo'shish | ha | ha | ha | yo'q |
+| OUT / TRANSFER | ha | ha | ha | yo'q |
+| ADJUSTMENT | ha | ha | yo'q | yo'q |
+| Sifat holati | ha | ha | yo'q | yo'q |
+| Hisobotlar | ha | ha | yo'q | yo'q |
+| Foydalanuvchi biriktirish | ha | o'z ombori | yo'q | yo'q |
 
-> Kategoriya yaratish faqat `super_admin` ga ochiq
-> (`_createProductCategoryHandler`, `bin/server.dart:641` yaqinida).
-> `warehouse_manager` mahsulot yarata oladi, lekin uning kategoriyasi
-> bo'lishi kerak — ya'ni kategoriya `super_admin` tomonidan oldindan
-> yaratilishi lozim. Bu ongli cheklov: katalogni kuzatish markazda qoladi.
-
-> `operator` global roli `users.role` da bo'lsa, `_canOperateInventory` uni
-> inventory amallariga yo'ladi — bu eski moslik mexanizmi. Oddiy foydalanish
-> ombor roli orqali.
-
-### Foydalanuvchi berish
-
-```powershell
-curl -s -X POST localhost:8080/warehouses/1/users `
-  -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" `
-  -d '{"user_id":2,"role":"operator"}'
-```
+Barcha ruxsatlar backend'da tekshiriladi. Frontend faqat tugmalarni
+yashiradi.
 
 ---
 
 ## 8. Texnik arxitektura
 
-### Texnologiyalar
-
 | Qatlam | Texnologiya |
 |---|---|
 | Backend | Dart 3, Shelf, shelf_router |
-| Ma'lumotlar bazasi | PostgreSQL 18 (Docker) |
+| Ma'lumotlar bazasi | Neon PostgreSQL |
+| Hosting | Render (Docker, Frankfurt) |
 | Autentifikatsiya | JWT (7 kun), bcrypt |
 | Frontend | Flutter 3, Riverpod, Dio |
-| Kamera | mobile_scanner (faqat mobil) |
 | QR/PDF | pdf, barcode, printing |
-| Excel | excel (o'qish va yozish) |
+| Excel | excel |
 
-### So'rov oqimi
+So'rov oqimi:
 
-```
-Flutter ilova
-    │  Dio HTTP + "Authorization: Bearer <token>"
-    ▼
-Shelf server (0.0.0.0:8080)
-    │  authMiddleware → JWT tekshiruvi
-    ▼
-Ruxsat tekshiruvi (_canManageProducts / _canOperateInventory / _checkWarehouseAccess)
-    ▼
-openConnection() → PostgreSQL (localhost:5432)
-    ▼
-javob (JSON yoki .xlsx)
+```text
+Flutter -> HTTPS -> Render (Shelf + auth + ruxsat) -> Neon PostgreSQL
 ```
 
-### Autentifikatsiya
-
-Login `JWT` qaytaradi, 7 kun amal qiladi. Keyingi so'rovlarda
-`Authorization: Bearer <token>` yuboriladi.
-
-**Token saqlanmaydi** — ilova yopilganda kirish yo'qoladi, qayta kirish
-kerak. Bu ataylab qilingan (avval saqlangan bo'lsa, o'g'irlangan tayyor
-holatda kirish mumkin bo'lardi).
-
-### Ruxsat tekshiruvi
-
-`super_admin` barcha omborlarni ko'radi. Boshqalar faqat
-`user_warehouse_access` da biriktirilgan omborlar. Bu **backend**da
- tekshiriladi — frontend faqat tugmalarni yashiradi.
-
-> Muhim: frontend'da yashirilgan tugma backend'da tekshiriladi, lekin
-> backend'da tekshirilmaydigan joy bo'lsa, API orqali atlab o'tish mumkin.
-> Shu sababli barcha tekshiruvlar serverda bajarilgan.
-
-### Ma'lumotlar bazasi ulanishi
-
-`lib/db/connection.dart` `.env` faylini `DotEnv(includePlatformEnvironment: true)`
-bilan o'qiydi — ya'ni muhit o'zgaruvchilari ham ko'riladi.
-
-`sslmode=require` bo'lsa TLS yoqiladi. Lokal Postgres uchun kerak emas
-(localhost).
+`lib/db/connection.dart` `DATABASE_URL`ni muhitdan oladi. Neon uchun
+`sslmode=require` TLS'ni yoqadi.
 
 ---
 
 ## 9. Ma'lumotlar bazasi
 
-13 ta jadval. Barchasi `organizations` orqali bitta tashkilotga bog'langan
-(Eclair).
+Asosiy jadvallar:
 
-### Asosiy jadvallar
-
-```
-organizations (1)
-    └── warehouses
-            ├── zones
-            │       └── storage_locations
-            ├── user_warehouse_access ──→ users
-            └── batch_containers ──→ batches ──→ products ──→ product_categories
-                    └── storage_locations
-            └── inventory_transactions ──→ users
-quality_status_history ──→ batches, users
+```text
+organizations
+  -> warehouses -> zones -> storage_locations
+  -> user_warehouse_access -> users
+  -> batch_containers -> batches -> products -> product_categories
+       -> storage_locations
+  -> inventory_transactions -> users
+quality_status_history -> batches, users
 ```
 
-### `users` — foydalanuvchilar
+Muhim jadvallar:
 
-| Ustun | Turi | Izoh |
-|---|---|---|
-| id | SERIAL | PK |
-| email | TEXT UNIQUE | login |
-| password_hash | TEXT | bcrypt |
-| full_name | TEXT | |
-| role | TEXT | `super_admin` (global) |
-| organization_id | INTEGER FK | |
+- `users` - email, bcrypt parol, global rol, organization.
+- `warehouses`, `zones`, `storage_locations` - ombor tuzilmasi.
+- `product_categories`, `products` - katalog va atributlar.
+- `batches`, `batch_containers` - partiya va fizik idishlar.
+- `inventory_transactions` - OUT/TRANSFER/ADJUSTMENT audit izi.
+- `quality_status_history` - sifat holati tarixi.
 
-### `warehouses` — omborlar
-
-`organization_id` FK, `name`, `address`, `city`.
-
-### `user_warehouse_access` — ombor rollari
-
-`user_id` + `warehouse_id` (UNIQUE juftligi), `role`
-(`super_admin` / `warehouse_manager` / `operator` / `viewer`).
-
-### `product_categories` — kategoriyalar
-
-`name`, `product_type`, `attribute_schema` (JSONB, default `[]`).
-
-**Atribut shakli:** `{"key": "harorat", "label": "Saqlash harorati",
-"type": "text"}`. Ruxsat etilgan turlar: `text`, `number`, `bool`, `date`.
-
-### `products` — mahsulotlar
-
-`category_id` FK, `sku` (tashkilot ichida UNIQUE), `barcode` (indekslangan),
-`name`, `unit`, `min_stock`, `max_stock`, `default_shelf_life_days`,
-`attributes` (JSONB).
-
-### `batches` — partiyalar
-
-`product_id` FK, `lot_number`, `manufacture_date`, `expiry_date`,
-`received_date`, `quality_status`
-(`pending_inspection` / `approved` / `quarantine` / `rejected`).
-
-### `batch_containers` — konteynerlar
-
-`batch_id` FK, `container_barcode` (global UNIQUE), `quantity`, `location_id` FK,
-`status` (`active` / `reserved` / `expired` / `damaged`).
-
-### `inventory_transactions` — audit izi
-
-`type` (`OUT` / `TRANSFER` / `ADJUSTMENT`), `batch_container_id` FK,
-`from_location_id`, `to_location_id`, `quantity`, `performed_by` FK, `note`.
-
-### `storage_locations`
-
-`zone_id` FK, `aisle`, `rack`, `shelf`, `bin`, `code` (ombor ichida UNIQUE),
-`capacity_units`, `current_units`.
-
-### `quality_status_history`
-
-`batch_id` FK, `from_status`, `to_status`, `note`, `changed_by` FK,
-`changed_at`.
-
-### Migratsiyalar
-
-`bin/migrate.dart` `lib/db/migrations/*.sql` fayllarini **nom bo'yicha
-tartiblab** bajaradi. Bajarilgan fayllar `schema_migrations` jadvalida
-kuzatiladi va qayta bajarilmaydi.
-
-```
-SKIP: 001_create_users.sql (allaqachon bajarilgan)
-Migratsiya tugadi: 0 qo'llandi, 13 o'tkazildi
-```
-
-Har bir migratsiya **tranzaksiya ichida** bajariladi — xato bo'lsa butun
-migratsiya orqaga qaytariladi.
-
-> Yangi migratsiya qo'shish: `lib/db/migrations/014_....sql` nomi bilan
-> yarating. Nomi `015`, `016` dan kichik bo'lmasligi kerak.
+Migratsiyalar `lib/db/migrations/*.sql` da, tartib bilan bajariladi.
+Bajarilganlari `schema_migrations` jadvalida kuzatiladi.
 
 ---
 
 ## 10. API ro'yxati
 
-Barcha endpoint'lar `/` dan boshlanadi. `🔒` — token talab qiladi.
+Bazaviy manzil: `https://eclair-wms-app.onrender.com`
+
+`lock` belgisi token talab qiladi: `Authorization: Bearer <TOKEN>`.
 
 ### Tizim
 
 | Metod | Yo'l | Vazifasi |
 |---|---|---|
-| GET | `/health` | Bazaning holati |
-| POST | `/setup` | Birinchi admin (faqat bo'sz bazada) |
+| GET | `/health` | Server va baza holati |
+| POST | `/setup` | Birinchi admin (baza bo'sh bo'lsa) |
 | POST | `/login` | JWT olish |
 
 ### Autentifikatsiya
 
 | Metod | Yo'l | Vazifasi |
 |---|---|---|
-| 🔒 GET | `/me` | Joriy foydalanuvchi |
+| lock GET | `/me` | Joriy foydalanuvchi |
 
 ### Omborlar
 
-| Metod | Yo'l | Vazifasi | Rol |
-|---|---|---|---|
-| 🔒 GET | `/warehouses` | Ro'yxat (o'z omborlari) | |
-| 🔒 POST | `/warehouses` | Yangi ombor | super_admin |
-| 🔒 GET | `/warehouses/{id}` | Ombor ma'lumoti | |
-| 🔒 GET | `/warehouses/{id}/users` | Foydalanuvchilar | |
-| 🔒 POST | `/warehouses/{id}/users` | Rol berish | manager |
+| Metod | Yo'l | Vazifasi |
+|---|---|---|
+| lock GET | `/warehouses` | Ro'yxat |
+| lock POST | `/warehouses` | Yangi ombor (super_admin) |
+| lock GET | `/warehouses/{id}` | Ombor ma'lumoti |
+| lock GET | `/warehouses/{id}/users` | Foydalanuvchilar |
+| lock POST | `/warehouses/{id}/users` | Rol berish |
 
 ### Kategoriyalar va mahsulotlar
 
-| Metod | Yo'l | Vazifasi | Rol |
-|---|---|---|---|
-| 🔒 GET | `/product-categories` | Ro'yxat | |
-| 🔒 POST | `/product-categories` | Yangi kategoriya | super_admin |
-| 🔒 GET | `/product-categories/{id}` | Bitta kategoriya | |
-| 🔒 GET | `/products` | Ro'yxat (`?search=`, `?category_id=`) | |
-| 🔒 POST | `/products` | Yangi mahsulot | manager |
-| 🔒 PUT | `/products/{id}` | Tahrirlash | manager |
-| 🔒 GET | `/products/{id}` | Mahsulot | |
-| 🔒 GET | `/products/barcode/{code}` | Shtrix-koddan | |
+| Metod | Yo'l | Vazifasi |
+|---|---|---|
+| lock GET | `/product-categories` | Ro'yxat |
+| lock POST | `/product-categories` | Yangi kategoriya |
+| lock GET | `/product-categories/{id}` | Bitta kategoriya |
+| lock GET | `/products` | Ro'yxat (`?search=`, `?category_id=`) |
+| lock POST | `/products` | Yangi mahsulot |
+| lock PUT | `/products/{id}` | Tahrirlash |
+| lock GET | `/products/{id}` | Mahsulot |
+| lock GET | `/products/barcode/{code}` | Shtrix-koddan |
 
 ### Zonalar va joylashuvlar
 
-| Metod | Yo'l | Vazifasi | Rol |
-|---|---|---|---|
-| 🔒 GET | `/warehouses/{id}/zones` | Zonalar | |
-| 🔒 POST | `/warehouses/{id}/zones` | Yangi zona | manager |
-| 🔒 GET | `/warehouses/{id}/storage-locations` | Joylashuvlar | |
-| 🔒 POST | `/warehouses/{id}/storage-locations` | Yangi joylashuv | manager |
-| 🔒 GET | `/storage-locations/{id}` | Bitta joylashuv | |
-| 🔒 GET | `/storage-locations/code/{code}` | Koddan topish | |
+| Metod | Yo'l | Vazifasi |
+|---|---|---|
+| lock GET | `/warehouses/{id}/zones` | Zonalar |
+| lock POST | `/warehouses/{id}/zones` | Yangi zona |
+| lock GET | `/warehouses/{id}/storage-locations` | Joylashuvlar |
+| lock POST | `/warehouses/{id}/storage-locations` | Yangi joylashuv |
+| lock GET | `/storage-locations/{id}` | Bitta joylashuv |
+| lock GET | `/storage-locations/code/{code}` | Koddan topish |
 
 ### Partiyalar va konteynerlar
 
-| Metod | Yo'l | Vazifasi | Rol |
-|---|---|---|---|
-| 🔒 GET | `/products/{id}/batches` | Partiyalar | |
-| 🔒 POST | `/products/{id}/batches` | Yangi partiya | manager |
-| 🔒 GET | `/products/{id}/locations` | Mahsulot qayerda | |
-| 🔒 GET | `/batches/{id}/containers` | Konteynerlar | |
-| 🔒 POST | `/batches/{id}/containers` | Yangi konteyner | manager |
-| 🔒 GET | `/containers/barcode/{code}` | Shtrix-koddan | |
+| Metod | Yo'l | Vazifasi |
+|---|---|---|
+| lock GET | `/products/{id}/batches` | Partiyalar |
+| lock POST | `/products/{id}/batches` | Yangi partiya |
+| lock GET | `/products/{id}/locations` | Mahsulot qayerda |
+| lock GET | `/batches/{id}/containers` | Konteynerlar |
+| lock POST | `/batches/{id}/containers` | Yangi konteyner |
+| lock GET | `/containers/barcode/{code}` | Shtrix-koddan |
 
 ### Inventory
 
-| Metod | Yo'l | Vazifasi | Rol |
-|---|---|---|---|
-| 🔒 POST | `/inventory/out` | Chiqarish | operator |
-| 🔒 POST | `/inventory/transfer` | Ko'chirish | operator |
-| 🔒 POST | `/inventory/adjustment` | Tuzatish | manager |
-| 🔒 GET | `/inventory/transactions` | Tarix (`?batch_container_id=`) | |
+| Metod | Yo'l | Vazifasi |
+|---|---|---|
+| lock POST | `/inventory/out` | Chiqarish |
+| lock POST | `/inventory/transfer` | Ko'chirish |
+| lock POST | `/inventory/adjustment` | Tuzatish |
+| lock GET | `/inventory/transactions` | Tarix |
+| lock POST | `/inventory/opening-stock` | Excel boshlang'ich qoldiq (`?dry_run=true`) |
 
 ### FEFO
 
-| Metod | Yo'l | Vazifasi | Rol |
-|---|---|---|---|
-| 🔒 GET | `/products/{id}/fefo-plan?quantity=` | Reja | |
-| 🔒 POST | `/products/{id}/fefo-out` | Reja bo'yicha chiqarish | operator |
+| Metod | Yo'l | Vazifasi |
+|---|---|---|
+| lock GET | `/products/{id}/fefo-plan?quantity=` | Reja |
+| lock POST | `/products/{id}/fefo-out` | Reja bo'yicha chiqarish |
 
-**FEFO qanday ishlaydi:** `expiry_date` bo'yicha o'sish tartibida
-(`NULL` oxirda), keyin partiya va konteyner id'si. Faqat `approved` va
-`active` konteynerlar hisobga olinadi. Yetarli miqdor yo'q bo'lsa —
-`insufficient_quantity` xatosi.
+FEFO `expiry_date` bo'yicha o'sadi (`NULL` oxirda), keyin partiya va
+konteyner id'si. Faqat `approved` va `active` konteynerlar hisoblanadi.
 
 ### Sifat
 
-| Metod | Yo'l | Vazifasi | Rol |
-|---|---|---|---|
-| 🔒 GET | `/quality/pending` | Tekshiruv navbati | |
-| 🔒 POST | `/batches/{id}/quality-status` | Holatni o'zgartirish | manager |
-| 🔒 GET | `/batches/{id}/quality-history` | Tarix | |
+| Metod | Yo'l | Vazifasi |
+|---|---|---|
+| lock GET | `/quality/pending` | Tekshiruv navbati |
+| lock POST | `/batches/{id}/quality-status` | Holatni o'zgartirish |
+| lock GET | `/batches/{id}/quality-history` | Tarix |
 
 ### Ogohlantirishlar va hisobotlar
 
-| Metod | Yo'l | Vazifasi | Rol |
-|---|---|---|---|
-| 🔒 GET | `/alerts/expiring-batches?days=` | Ogohlantirishlar | |
-| 🔒 GET | `/alerts/summary` | Badge uchun sonlar | |
-| 🔒 GET | `/reports/stock.xlsx` | Qoldiq hisoboti | manager |
-| 🔒 GET | `/reports/transactions.xlsx?from=&to=` | Harakatlar | manager |
+| Metod | Yo'l | Vazifasi |
+|---|---|---|
+| lock GET | `/alerts/expiring-batches?days=` | Ogohlantirishlar |
+| lock GET | `/alerts/summary` | Badge uchun sonlar |
+| lock GET | `/reports/stock.xlsx` | Qoldiq hisoboti |
+| lock GET | `/reports/transactions.xlsx?from=&to=` | Harakatlar |
 
 ### Xatolar
 
@@ -729,252 +484,138 @@ Barcha endpoint'lar `/` dan boshlanadi. `🔒` — token talab qiladi.
 | `unauthorized` | Token yo'q yoki muddati tugagan |
 | `forbidden` | Ruxsat yo'q |
 | `invalid_request` | So'rov noto'g'ri |
+| `validation_failed` | Import qatorlarida xatolar |
 | `sku_already_exists` | SKU band |
 | `barcode_already_exists` | Shtrix-kod band |
-| `location_already_exists` | Joylashuv kodi band |
 | `insufficient_quantity` | Qoldiq yetarli emas |
-| `note_required` | Izoh majburiy |
-| `invalid_attributes` | Atribut turi mos emas |
 | `invalid_transition` | Sifat holati o'tkazib bo'lmaydi |
 
 ---
 
 ## 11. Testlar
 
-### Smoke test — haqiqiy server bilan
+### Birlik testlari
 
-```powershell
-# Terminal 1
-dart run bin/server.dart
+Tarmoq va bazasiz:
 
-# Terminal 2
+```bash
+cd warehouse
+dart analyze
+dart test
+```
+
+```bash
+cd eclair-wms-app
+flutter test
+```
+
+### Live smoke test
+
+Faqat alohida test backend'ga qarshi ishlaydi. Production'ga tasodifan
+urilmasligi uchun uchta muhit o'zgaruvchisi majburiy:
+
+```bash
+WMS_TEST_BASE_URL=https://<test-backend> \
+WMS_TEST_EMAIL=<test-email> \
+WMS_TEST_PASSWORD=<test-password> \
 dart test test/smoke_test.dart
 ```
 
-Tekshiradi: bazaning ulanishi, noto'g'ri parol 401 berishi, `/me` token
-bilan va tokensiz, omborlar ro'yxati, noma'lum yo'l 404.
+Muhit o'zgaruvchilari berilmasa test o'tkazib yuboriladi.
 
-Login ma'lumotlarini o'zgartirish:
+### Frontend live testi
 
-```powershell
-$env:WMS_TEST_EMAIL="boshqa@eclair.uz"
-$env:WMS_TEST_PASSWORD="Parol123!"
-dart test test/smoke_test.dart
+Skaner live testi ham faqat aniq test backend'da ishlaydi:
+
+```bash
+WMS_LIVE_TEST=1 \
+WMS_TEST_BASE_URL=https://<test-backend> \
+WMS_TEST_EMAIL=<test-email> \
+WMS_TEST_PASSWORD=<test-password> \
+flutter test test/features/scanner/scan_result_test.dart
 ```
-
-> `test/server_test.dart` — `shelf` paketidan qolgan scaffold qoldig'i. U
-> `/` va `/echo/hello` endpointlarini tekshiradi, WMS da bunday
-> endpointlar **yo'q**. Shu sababli `dart test` har doim qizil chiqadi va
-> o'z serverini 8080-portga ulashga urilib, ishlab turgan serverni
-> buzadi. Uni ishlatmang yoki o'chiring.
-
-### Tekshiruv
-
-```powershell
-cd warehouse; dart analyze
-cd eclair-wms-app; flutter analyze
-```
-
-### Frontend testlari
-
-```powershell
-cd eclair-wms-app; flutter test
-```
-
-> `test/features/products/import_planner_test.dart` MacBook'dagi aniq fayl
-> yo'lini (`/Downloads/...xlsx`) talab qiladi. Boshqa kompyuterda bu test
-> o'tmaydi — `WMS_TEST_XLSX` muhit o'zgaruvchisi bilan to'g'ri yo'l
-> bering yoki o'zgartiring.
 
 ---
 
 ## 12. Muammolar va yechimlar
 
-### Server ishlamayapti / `SocketException`
+### `health` sekin javob beradi
 
-Sabab: 8080-port band. Boshqa server yoki eski jarayon ishlab turibdi.
+Render bepul tarifda servis uxlab qoladi. Birinchi so'rov 30-60 soniya
+kutishi mumkin. Keyingi so'rovlar tez.
 
-```powershell
-Get-NetTCPConnection -LocalPort 8080 -State Listen
-Stop-Process -Id <PID> -Force
-```
+### `502` yoki `Application failed to respond`
+
+Render dashboard -> Logs bo'limini tekshiring. Ko'p sabab: `DATABASE_URL`
+noto'g'ri, Neon uxlab qolgan yoki migratsiya bajarilmagan.
+
+### `{"error":"database_unavailable"}` yoki ulanish xatosi
+
+- `DATABASE_URL` Neon qiymati ekanini tekshiring.
+- `sslmode=require` borligini tekshiring.
+- Neon loyihasi pauza bo'lmaganini tekshiring.
 
 ### `relation "users" does not exist`
 
-Migratsiyalar bajarilmagan yoki boshqa bazaga ulangan:
+Migratsiyalar Neon bazasiga qo'llanmagan:
 
-```powershell
-dart run bin/migrate.dart
+```bash
+DATABASE_URL=<neon-url> dart run bin/migrate.dart
 ```
 
-`.env` dagi `DATABASE_URL` to'g'rimi (`localhost:5432/wms`)?
+### `401 unauthorized`
 
-### Docker: ma'lumot yo'qoldi, jadvallar topilmadi
+Token yo'q yoki muddati tugagan. Qayta login qiling.
 
-Bu eng ko'p uchraydigan muammo. Sabab — `docker compose` volume nomiga
-o'z prefiksi qo'shadi (`warehouse_wms_pgdata`), shuning uchun avval
-qo'lda yaratilgan `wms_pgdata` ga ulanmaydi.
+### `403 forbidden`
 
-`docker-compose.yml` da volume nomi aniq belgilanishi kerak:
+Foydalanuvchining ombor roli yetarli emas. `warehouse_manager` yoki
+`super_admin` kerak.
 
-```yaml
-volumes:
-  wms_pgdata:
-    name: wms_pgdata
-```
+### `404 Route not found`
 
-Tekshirish:
+Endpoint hali Render'ga deploy qilinmagan yoki yo'l noto'g'ri. So'nggi
+deploy holatini Render dashboard'da tekshiring.
 
-```powershell
-docker volume ls | Select-String wms
-docker exec wms-postgres psql -U wms -d wms -c "\dt"
-```
+### Excel import xatolari
 
-### Postgres konteyneri to'xtagan
+`Tekshirish` (`dry_run`) qator raqami va sababni qaytaradi. Ko'p uchraydigan
+sabablar: SKU bo'sh, idish soni son emas, yaroqlilik sanasi noto'g'ri,
+ombor tanlanmagan, joylashuv kodi topilmadi.
 
-```powershell
-docker compose up -d
-docker compose ps        # (healthy) bo'lishi kerak
-```
+### QR yorliq chiqmaydi
 
-`docker compose ps` da `Exited` ko'rinsa, `docker logs wms-postgres` bilan
-sababni ko'ring.
-
-### Flutter: build xatosi
-
-```powershell
-cd eclair-wms-app
-flutter clean
-flutter pub get
-flutter build windows --debug
-```
-
-### Skaner Windows'da ishlamaydi
-
-`mobile_scanner` faqat Android, iOS, macOS va Web'ni qo'llab-quvvatlaydi —
-**Windows'ni qo'llamaydi**. Windows'da skaner funksiyasi ishlamaydi.
-Yechim: telefonda yoki `flutter run -d chrome` orqali.
-
-### Hisobot yuklanmayapti
-
-Rol yetarli emas (`warehouse_manager` yoki `super_admin` kerak). Yoki server
-ishlamayapti.
-
-### Import: qatorlar o'tkazilmaydi
-
-Sabablar `Nomi yo'q`, `SKU yo'q`, `Faylda takrorlangan SKU`,
-`Bazada allaqachon bor`. Ekran sabablarni ko'rsatadi.
-
-### Server kompyuterni qayta ishga tushirgandan keyin to'xtaydi
-
-Server qo'lda ishga tushirilgan jarayon — u ham kompyuter bilan birga
-to'xtaydi. `docker compose up -d` dan keyin `dart run bin/server.dart`
-yana kerak.
-
-### Ma'lumotni zaxiralash
-
-> **Muhim:** PowerShell'da `>` yoki `| pg_restore` **ishlatmang**.
-> PowerShell `>` operatori faylni UTF-16 matn sifatida yozadi va zaxira
-> fayl buziladi. Boshlanishi `fffe` bo'lgan fayl — bu buzilgan zaxira.
-
-To'g'ri usul — konteyner ichida yozib, `docker cp` bilan olish:
-
-```powershell
-New-Item -ItemType Directory -Force -Path .\zaxira
-docker exec wms-postgres pg_dump -U wms -d wms -Fc -f /tmp/wms.dump
-docker cp wms-postgres:/tmp/wms.dump .\zaxira\wms-2026-10-03.dump
-docker exec wms-postgres rm -f /tmp/wms.dump
-```
-
-Tekshirish (fayl to'g'riligi):
-
-```powershell
-docker run --rm -v "${PWD}\zaxira:/in:ro" postgres:18-alpine `
-  pg_restore -l /in/wms-2026-10-03.dump
-```
-
-Fayl to'g'ri bo'lsa ro'yxat chiqadi va birinchi bayt `PGDMP` bo'ladi.
-
-### Ma'lumotni tiklash
-
-```powershell
-docker exec wms-postgres mkdir -p /tmp/restore
-docker cp .\zaxira\wms-2026-10-03.dump wms-postgres:/tmp/restore/wms.dump
-docker exec wms-postgres pg_restore -U wms -d wms --no-owner --no-acl --clean --if-exists /tmp/restore/wms.dump
-docker exec wms-postgres rm -rf /tmp/restore
-```
-
-> Faqat `wms_pgdata` volume'ini zaxiralash ham yetarli — butun bazadagi
-> barcha ma'lumot shu volume'da. Lekin `pg_dump` yondashuvi ixcham va
-> boshqa kompyuterga ko'chirish oson.
+Konteyner barcode'i mavjudligini va printer ulanganini tekshiring. Ko'p
+yorliq 300 tadan bo'lib chiqariladi.
 
 ---
 
-## 13. Keyingi bosqichlar
+## 13. Xavfsizlik
 
-Hozirgi holat: A → B → C va E bosqichlari bajarilgan. **D bosqichi
-bajarilmagan.**
-
-### Hozirgi ma'lumotlar holati
-
-Bazada 2 ta ombor (Tashkent-1, Samarkand-1), 3 ta kategoriya, 370 ta
-mahsulot, 15 ta partiya va 10 ta konteyner bor.
-
-> **E'tibor:** birinchi sinov partiyalarining muddati o'tgan
-> (`2026-09-01`, `2026-09-25`, `2026-09-29` — joriy sana 2026-10-03 dan
-> oldin). Shuning uchun 🔔 ogohlantirishlar qizil rangda to'lgan bo'lishi
-> normal. Bu ma'lumotlar MacBook'dagi sinovdan qolgan. Tozalash uchun
-> o'sha partiyalarni `rejected` holatga o'tkazing — ular hisobotlardan chiqadi.
-
-Yo'q bo'lgan imkoniyatlar:
-
-**D1 — Chiqish buyurtmalari va picking.** Hozir FEFO faqat bitta mahsulot
-bo'yicha ishlaydi. Haqiqiy buyurtma oqimi (buyurtma → ajratish → picking
-listi → tasdiqlash) mavjud emas.
-
-**D2 — Kirish/qabul (Receiving).** Ta'minotchi, kirim hujjati, partiyani
-joylashuvga qabul qilish.
-
-**D3 — Inventarizatsiya.** Count sessiyasi, ko'rsatilgan va haqiqiy
-qoldiq, farqni avtomatik ADJUSTMENTga aylantirish.
-
-**D4 — Dashboard.** Umumiy ko'rsatkichlar: qoldiq, aylanma, muddati yaqin,
-kunlik harakatlar.
-
-**D5 — Foydalanuvchilar ekrani.** Backendda bor, frontendda yo'q:
-foydalanuvchi yaratish, omborga biriktirish, rol boshqaruv.
-
-### Texnik qarz
-
-- **Token saqlanmaydi** — ilova yopilganda kirish yo'qoladi.
-- **`test/server_test.dart`** ishlatilmaydi, `dart test` ni buzadi.
-- **`mobile_scanner`** Windows'da ishlamaydi.
-- **Frontendda rol tekshiruvi** faqat tugmalarni yashiradi; haqiqiy nazorat
-  backendda (bu to'g'ri, lekin frontendda ikki marta takrorlanadi).
-- **Ochqiq test muhiti** — `admin@eclair.uz` / `Test1234!` ishlatiladi.
+- `DATABASE_URL`, `JWT_SECRET` va Telegram qiymatlari faqat Render
+  dashboard'da saqlanadi.
+- Real parollar, tokenlar va connection string'lar repo'ga yozilmaydi.
+- Login tokeni 7 kun amal qiladi va ilova yopilganda saqlanmaydi.
+- Barcha ruxsatlar backend'da tekshiriladi; frontend faqat UI yashiradi.
+- Neon ulanishida `sslmode=require` majburiy.
 
 ---
 
-## Tez havolalar
+## Tezkor havolalar
 
-```powershell
-# Ishga tushirish
-cd warehouse; docker compose up -d; dart run bin/server.dart
-
-# Tekshirish
-curl -s localhost:8080/health
-
-# Testlar
-cd warehouse; dart test test/smoke_test.dart
-cd eclair-wms-app; flutter test
+```bash
+# Health
+curl -s https://eclair-wms-app.onrender.com/health
 
 # Ilova
-cd eclair-wms-app; flutter run -d windows
+cd eclair-wms-app && flutter run -d macos
 
-# Ma'lumotlar
-docker compose ps
-docker exec wms-postgres psql -U wms -d wms -c "\dt"
+# Backend tekshiruv
+cd warehouse && dart analyze && dart test
 
-# To'xtatish
-docker compose stop
+# Ilova tekshiruv
+cd eclair-wms-app && flutter analyze && flutter test
+
+# Migratsiya (Neon)
+DATABASE_URL=<neon-url> dart run bin/migrate.dart
 ```
