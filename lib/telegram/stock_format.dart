@@ -73,20 +73,6 @@ String stockLine(String sku, String unit, List<(num, int)> groups) {
   return '$sku - ${groupSummary(groups, unit)} qoldi';
 }
 
-/// Chiqim xabari bitta konteyner qatori:
-/// `Chiqdi: 170kg (konteyner L0012-B3, lot LOT-2026-001)`.
-class OutItem {
-  const OutItem({
-    required this.containerBarcode,
-    required this.lotNumber,
-    required this.quantity,
-  });
-
-  final String containerBarcode;
-  final String lotNumber;
-  final num quantity;
-}
-
 /// Toshkent vaqti (UTC+5, yozgi vaqtga o'tmaydi):
 /// `16.10.2026 17:05`.
 String tashkentTime(DateTime time) {
@@ -101,28 +87,24 @@ String tashkentTime(DateTime time) {
 /// Xabar matni (emoji `📤` shu qatorda):
 /// ```
 /// 📤 CHIQIM
-/// L 001/2 - Sodium laureth sulfate
-/// Chiqdi: 170kg (konteyner L0012-B3, lot LOT-2026-001)
-/// Qoldiq: 209*170kg=35530kg
-/// Kim: Otabek Karimov | 16.10.2026 17:05
+/// L 003 - 1000kg
+/// Qoldiq: 1*32000kg + 1*1000kg = 33000kg
+/// Kim: Admin | 09.11.2026 12:14
 /// ```
-/// FEFO bir nechta konteynerdan chiqarsa - har konteyner alohida qatorda,
-/// keyin bitta umumiy `Qoldiq:` qatori (chiqimdan KEYINGI holat).
+/// FEFO bir nechta konteynerdan chiqarsa - miqdorlar yig'indisi bitta
+/// qatorda, keyin bitta umumiy `Qoldiq:` qatori (chiqimdan KEYINGI holat).
 String buildOutMessage({
   required String sku,
-  required String productName,
   required String unit,
-  required List<OutItem> items,
+  required List<num> quantities,
   required List<(num, int)> remainingGroups,
   required String performer,
   required DateTime time,
 }) {
+  final totalOut = quantities.fold<num>(0, (sum, value) => sum + value);
   final lines = <String>[
     '📤 CHIQIM',
-    '$sku - $productName',
-    for (final item in items)
-      'Chiqdi: ${formatQty(item.quantity)}$unit '
-          '(konteyner ${item.containerBarcode}, lot ${item.lotNumber})',
+    '$sku - ${formatQty(totalOut)}$unit',
     'Qoldiq: ${groupSummary(remainingGroups, unit)}',
     'Kim: $performer | ${tashkentTime(time)}',
   ];

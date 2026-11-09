@@ -117,15 +117,8 @@ void main() {
     test('bitta konteyner - aniq shablonga mos', () {
       final message = buildOutMessage(
         sku: 'L 001/2',
-        productName: 'Sodium laureth sulfate',
         unit: 'kg',
-        items: const [
-          OutItem(
-            containerBarcode: 'L0012-B3',
-            lotNumber: 'LOT-2026-001',
-            quantity: 170,
-          ),
-        ],
+        quantities: const [170],
         remainingGroups: [(170, 209)],
         performer: 'Otabek Karimov',
         time: DateTime.utc(2026, 10, 16, 12, 5),
@@ -133,42 +126,26 @@ void main() {
       expect(
         message,
         '📤 CHIQIM\n'
-        'L 001/2 - Sodium laureth sulfate\n'
-        'Chiqdi: 170kg (konteyner L0012-B3, lot LOT-2026-001)\n'
+        'L 001/2 - 170kg\n'
         'Qoldiq: 209*170kg=35530kg\n'
         'Kim: Otabek Karimov | 16.10.2026 17:05',
       );
     });
 
-    test('FEFO: har konteyner alohida qatorda, Qoldiq bitta', () {
+    test('FEFO: miqdorlar yig\'indisi bitta qatorda, Qoldiq bitta', () {
       final message = buildOutMessage(
         sku: 'L 001/2',
-        productName: 'Sodium laureth sulfate',
         unit: 'kg',
-        items: const [
-          OutItem(
-            containerBarcode: 'L0012-B3',
-            lotNumber: 'LOT-2026-001',
-            quantity: 170,
-          ),
-          OutItem(
-            containerBarcode: 'L0012-B4',
-            lotNumber: 'LOT-2026-001',
-            quantity: 93.5,
-          ),
-        ],
+        quantities: const [170, 93.5],
         remainingGroups: [(170, 208)],
         performer: 'Otabek Karimov',
         time: DateTime.utc(2026, 10, 16, 12, 5),
       );
       final lines = message.split('\n');
       expect(lines[0], '📤 CHIQIM');
-      expect(lines[2], 'Chiqdi: 170kg (konteyner L0012-B3, lot LOT-2026-001)');
-      expect(lines[3], 'Chiqdi: 93.5kg (konteyner L0012-B4, lot LOT-2026-001)');
-      expect(
-        lines.where((line) => line.startsWith('Qoldiq:')).single,
-        'Qoldiq: 208*170kg=35360kg',
-      );
+      expect(lines[1], 'L 001/2 - 263.5kg');
+      expect(lines[2], 'Qoldiq: 208*170kg=35360kg');
+      expect(lines[3], 'Kim: Otabek Karimov | 16.10.2026 17:05');
     });
 
     test('vaqt Toshkent (UTC+5)', () {

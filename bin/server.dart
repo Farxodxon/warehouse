@@ -2368,15 +2368,13 @@ void _notifyOut({
       final connection = await openConnection();
       try {
         late String sku;
-        late String name;
         late String unit;
         late int outProductId;
-        final items = <OutItem>[];
+        final quantities = <num>[];
 
         if (containerId != null) {
           final rows = await connection.query(
-            'SELECT p.id, p.sku, p.name, p.unit, b.lot_number, '
-            'bc.container_barcode '
+            'SELECT p.id, p.sku, p.unit '
             'FROM batch_containers bc '
             'JOIN batches b ON b.id = bc.batch_id '
             'JOIN products p ON p.id = b.product_id '
@@ -2387,29 +2385,19 @@ void _notifyOut({
           final row = rows.first;
           outProductId = row[0] as int;
           sku = row[1] as String;
-          name = row[2] as String;
-          unit = row[3] as String;
-          items.add(OutItem(
-            lotNumber: row[4] as String,
-            containerBarcode: row[5] as String,
-            quantity: quantity ?? 0,
-          ));
+          unit = row[2] as String;
+          quantities.add(quantity ?? 0);
         } else {
           outProductId = productId!;
           final rows = await connection.query(
-            'SELECT sku, name, unit FROM products WHERE id = @productId',
+            'SELECT sku, unit FROM products WHERE id = @productId',
             substitutionValues: {'productId': productId},
           );
           if (rows.isEmpty) return;
           sku = rows.first[0] as String;
-          name = rows.first[1] as String;
-          unit = rows.first[2] as String;
+          unit = rows.first[1] as String;
           for (final item in fefoItems ?? const <Map<String, dynamic>>[]) {
-            items.add(OutItem(
-              containerBarcode: (item['container_barcode'] ?? '').toString(),
-              lotNumber: (item['lot_number'] ?? '').toString(),
-              quantity: (item['take_quantity'] as num?) ?? 0,
-            ));
+            quantities.add((item['take_quantity'] as num?) ?? 0);
           }
         }
 
@@ -2428,9 +2416,8 @@ void _notifyOut({
 
         final message = buildOutMessage(
           sku: sku,
-          productName: name,
           unit: unit,
-          items: items,
+          quantities: quantities,
           remainingGroups: remaining,
           performer: performer,
           time: DateTime.now(),
