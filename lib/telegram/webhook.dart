@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:shelf/shelf.dart';
 
@@ -20,7 +21,7 @@ class TelegramSettings {
   /// Muhitdan o'qiydi: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`,
   /// `TELEGRAM_CHAT_IDS`, `RENDER_EXTERNAL_URL` yoki `PUBLIC_BASE_URL`.
   factory TelegramSettings.fromEnvironment([Map<String, String>? source]) {
-    final env = source ?? const <String, String>{};
+    final env = source ?? Platform.environment;
     final rawChatIds = env['TELEGRAM_CHAT_IDS'] ?? '';
     final chatIds = <String>{
       for (final part in rawChatIds.split(','))
