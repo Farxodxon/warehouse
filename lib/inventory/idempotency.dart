@@ -24,11 +24,10 @@ Handler idempotent(Handler inner) {
     final connection = await openConnection();
     try {
       // 1) kalitni band qilish
-      var claimed = await _claim(connection, key, userId, path);
+      final claimed = await _claim(connection, key, userId, path);
       if (!claimed) {
         final rows = await connection.query(
-          'SELECT status_code, response_body, method_path, '
-          "(created_at < now() - interval '2 minutes') AS stale "
+          'SELECT status_code, response_body, method_path '
           'FROM idempotency_keys WHERE idem_key = @key AND user_id = @userId',
           substitutionValues: {'key': key, 'userId': userId},
         );
@@ -36,7 +35,6 @@ Handler idempotent(Handler inner) {
           final status = rows.first[0] as int;
           final stored = rows.first[1] as String;
           final storedPath = rows.first[2] as String;
-          final stale = rows.first[3] as bool;
           if (storedPath != path) {
             return _json(422, {'error': 'idempotency_key_reused'});
           }
@@ -45,11 +43,9 @@ Handler idempotent(Handler inner) {
                 body: stored,
                 headers: {..._jsonHeaders, 'idempotent-replay': 'true'});
           }
-          if (!stale) return _json(409, {'error': 'request_in_progress'});
-          await _release(connection, key, userId); // eskirgan "jarayonda" yozuv
+          return _json(409, {'error': 'request_in_progress'});
         }
-        claimed = await _claim(connection, key, userId, path);
-        if (!claimed) return _json(409, {'error': 'request_in_progress'});
+        return _json(409, {'error': 'request_in_progress'});
       }
       // 2) asosiy handler
       Response response;
