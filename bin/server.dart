@@ -13,6 +13,7 @@ import 'package:wms_backend/auth/password.dart';
 import 'package:wms_backend/db/connection.dart';
 import 'package:wms_backend/inventory/expiry_alerts.dart';
 import 'package:wms_backend/inventory/fefo_planner.dart';
+import 'package:wms_backend/inventory/idempotency.dart';
 import 'package:wms_backend/inventory/opening_stock.dart';
 import 'package:wms_backend/inventory/quality_workflow.dart';
 import 'package:wms_backend/products/attribute_schema.dart';
@@ -53,7 +54,7 @@ final _router = Router()
   ..get('/products/<productId>/fefo-plan',
       authMiddleware()(_fefoPlanHandler))
   ..post('/products/<productId>/fefo-out',
-      authMiddleware()(_fefoOutHandler))
+      authMiddleware()(idempotent(_fefoOutHandler)))
   ..get('/alerts/expiring-batches',
       authMiddleware()(_expiringBatchesHandler))
   ..get('/alerts/summary', authMiddleware()(_alertsSummaryHandler))
@@ -75,7 +76,7 @@ final _router = Router()
   ..get('/products/<productId>/locations',
       authMiddleware()(_listProductLocationsHandler))
   ..post('/batches/<batchId>/containers',
-      authMiddleware()(_createBatchContainerHandler))
+      authMiddleware()(idempotent(_createBatchContainerHandler)))
   ..get('/batches/<batchId>/containers',
       authMiddleware()(_listBatchContainersHandler))
   ..post('/batches/<id>/quality-status',
@@ -86,14 +87,17 @@ final _router = Router()
       authMiddleware()(_qualityPendingHandler))
   ..get('/containers/barcode/<barcode>',
       authMiddleware()(_getContainerByBarcodeHandler))
-  ..post('/inventory/out', authMiddleware()(_inventoryOutHandler))
-  ..post('/inventory/transfer', authMiddleware()(_inventoryTransferHandler))
+  ..post('/inventory/out',
+      authMiddleware()(idempotent(_inventoryOutHandler)))
+  ..post('/inventory/transfer',
+      authMiddleware()(idempotent(_inventoryTransferHandler)))
   ..post('/inventory/adjustment',
-      authMiddleware()(_inventoryAdjustmentHandler))
+      authMiddleware()(idempotent(_inventoryAdjustmentHandler)))
   ..get('/inventory/transactions',
       authMiddleware()(_listInventoryTransactionsHandler))
   ..post('/inventory/opening-stock',
       authMiddleware()(_openingStockImportHandler))
+  ..get('/sync/snapshot', authMiddleware()(_syncSnapshotHandler))
   ..get('/reports/stock.xlsx',
       authMiddleware()(_stockReportHandler))
   ..get('/reports/transactions.xlsx',
@@ -2472,6 +2476,80 @@ void _registerTelegramWebhook(TelegramSettings settings) {
   }());
 }
 
+Future<Response> _syncSnapshotHandler(Request request) async {
+  final userId = request.context['userId'] as int;
+  final warehouseIdRaw = request.requestedUri.queryParameters['warehouse_id'];
+  int? warehouseId;
+  if (warehouseIdRaw != null && warehouseIdRaw.isNotEmpty) {
+    warehouseId = int.tryParse(warehouseIdRaw);
+    if (warehouseId == null) {
+      return _jsonResponse(400, '{"error":"invalid_warehouse_id"}');
+    }
+  }
+
+  final connection = await openConnection();
+  try {
+    final organizationId = await _getUserOrganizationId(connection, userId);
+    if (organizationId == null) {
+      return _jsonResponse(400, '{"error":"missing_organization"}');
+    }
+
+    final sql = StringBuffer(
+      'SELECT bc.id, bc.container_barcode, bc.batch_id, bc.quantity, '
+      'bc.unit_weight_kg, bc.location_id, sl.code, p.id, p.sku, p.name, p.unit, '
+      'b.lot_number, b.expiry_date, b.quality_status '
+      'FROM batch_containers bc '
+      'JOIN batches b ON b.id = bc.batch_id '
+      'JOIN products p ON p.id = b.product_id '
+      'LEFT JOIN storage_locations sl ON sl.id = bc.location_id '
+      "WHERE p.organization_id = @orgId AND bc.status = 'active' "
+      'AND bc.quantity > 0',
+    );
+    if (warehouseId != null) {
+      sql.write(' AND sl.warehouse_id = @warehouseId');
+    }
+    sql.write(' ORDER BY bc.id');
+
+    final result = await connection.query(
+      sql.toString(),
+      substitutionValues: {
+        'orgId': organizationId,
+        if (warehouseId != null) 'warehouseId': warehouseId,
+      },
+    );
+
+    final containers = <Map<String, dynamic>>[];
+    for (final row in result) {
+      containers.add({
+        'container_id': row[0],
+        'container_barcode': row[1],
+        'batch_id': row[2],
+        'quantity': _toNumOrNull(row[3]),
+        'unit_weight_kg': _toNumOrNull(row[4]),
+        'location_id': row[5],
+        'location_code': row[6],
+        'product_id': row[7],
+        'sku': row[8],
+        'product_name': row[9],
+        'unit': row[10],
+        'lot_number': row[11],
+        'expiry_date': _dateToString(row[12]),
+        'quality_status': row[13],
+      });
+    }
+
+    return _jsonResponse(
+        200,
+        jsonEncode({
+          'generated_at': DateTime.now().toUtc().toIso8601String(),
+          'count': containers.length,
+          'containers': containers,
+        }));
+  } finally {
+    await connection.close();
+  }
+}
+
 Future<Response> _inventoryOutHandler(Request request) async {
   final userId = request.context['userId'] as int;
   if (!await _canOperateInventory(userId)) {
@@ -3682,6 +3760,20 @@ void main(List<String> args) async {
   _telegramSettings = TelegramSettings.fromEnvironment();
   if (_telegramSettings!.enabled) {
     _telegramSender = HttpTelegramSender(token: _telegramSettings!.token);
+  }
+
+  // Idempotency kalitlarini best-effort tozalash: xato serverni to'xtatmaydi.
+  try {
+    final connection = await openConnection();
+    try {
+      await connection.execute(
+        "DELETE FROM idempotency_keys WHERE created_at < now() - interval '30 days'",
+      );
+    } finally {
+      await connection.close();
+    }
+  } catch (e) {
+    print('idempotency cleanup xatosi: $e');
   }
 
   final handler = Pipeline().addMiddleware(logRequests()).addHandler(_router);
